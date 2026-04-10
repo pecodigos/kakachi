@@ -9,7 +9,7 @@ Current responsibilities:
 - User register and login
 - Network creation, join, and peer listing
 - Session open/get
-- Live STUN-backed session negotiation trigger via local agent service
+- Live STUN-backed session negotiation trigger via local agent service, including UDP hole-punch hello/ack telemetry
 
 ## Architecture Boundary
 

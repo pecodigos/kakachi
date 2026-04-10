@@ -4,7 +4,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use kakachi_chat::{ChatEnvelope, ChatError, StoredMessage, TransportPath};
@@ -25,7 +25,11 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 const DEFAULT_STUN_RETRY_INTERVAL_MS: u64 = 500;
+const DEFAULT_PUNCH_RETRY_INTERVAL_MS: u64 = 250;
 const MAX_CONTROL_PLANE_ERROR_BODY_LEN: usize = 512;
+const MAX_PUNCH_PACKET_BYTES: usize = 256;
+const PUNCH_HELLO_PREFIX: &str = "kakachi-punch-hello:";
+const PUNCH_ACK_PREFIX: &str = "kakachi-punch-ack:";
 
 #[derive(Debug, Error)]
 pub enum AgentError {
@@ -162,6 +166,23 @@ pub struct NegotiationRunSummary {
     pub attempts_sent: u8,
     pub last_report: Option<SessionReport>,
     pub last_candidates: Vec<SocketAddr>,
+    pub hole_punch: Option<HolePunchTelemetry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HolePunchAttempt {
+    pub attempt: u8,
+    pub peer_candidates: Vec<SocketAddr>,
+    pub ack_endpoint: Option<SocketAddr>,
+    pub acknowledged: bool,
+    pub latency_ms: Option<u32>,
+    pub send_errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HolePunchTelemetry {
+    pub success: bool,
+    pub attempts: Vec<HolePunchAttempt>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -180,6 +201,21 @@ struct SessionProgressRequest {
     attempt: u8,
     candidate_count: u8,
     direct_ready: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct EndpointCandidateResponse {
+    endpoint: String,
+    #[serde(rename = "observed_at")]
+    _observed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PeerEndpointBundleResponse {
+    username: String,
+    #[serde(rename = "public_key")]
+    _public_key: String,
+    candidates: Vec<EndpointCandidateResponse>,
 }
 
 #[derive(Debug, Clone)]
@@ -235,6 +271,26 @@ impl ControlPlaneClient {
         Ok(())
     }
 
+    async fn list_endpoint_candidates(
+        &self,
+        network_id: Uuid,
+    ) -> Result<Vec<PeerEndpointBundleResponse>, AgentError> {
+        let response = self
+            .http
+            .get(format!(
+                "{}/v1/networks/{network_id}/endpoint-candidates",
+                self.base_url
+            ))
+            .bearer_auth(&self.access_token)
+            .send()
+            .await?;
+
+        let response = ensure_success(response).await?;
+        response
+            .json::<Vec<PeerEndpointBundleResponse>>()
+            .await
+            .map_err(AgentError::from)
+    }
     pub async fn open_session_negotiation(
         &self,
         network_id: Uuid,
@@ -562,6 +618,15 @@ impl AgentService {
     ) -> Result<Vec<NatObservation>, AgentError> {
         let bind_addr = self.stun_probe_bind_addr()?;
         let socket = tokio::net::UdpSocket::bind(bind_addr).await?;
+        self.collect_nat_observations_with_socket(plan, &socket)
+            .await
+    }
+
+    async fn collect_nat_observations_with_socket(
+        &self,
+        plan: &StunProbePlan,
+        socket: &tokio::net::UdpSocket,
+    ) -> Result<Vec<NatObservation>, AgentError> {
         let timeout = Duration::from_secs(u64::from(plan.probe_timeout_secs));
 
         let mut observations = Vec::with_capacity(plan.servers.len());
@@ -573,7 +638,7 @@ impl AgentService {
                 .set_timeout(timeout)
                 .set_retry_interval(Duration::from_millis(DEFAULT_STUN_RETRY_INTERVAL_MS));
 
-            match client.query_external_address_async(&socket).await {
+            match client.query_external_address_async(socket).await {
                 Ok(observed_addr) => {
                     debug!(server = %server.addr, observed_addr = %observed_addr, "stun probe succeeded");
                     observations.push(NatObservation {
@@ -605,6 +670,93 @@ impl AgentService {
         Ok(observations)
     }
 
+    async fn run_hole_punch_attempt(
+        &self,
+        socket: &tokio::net::UdpSocket,
+        session_id: Uuid,
+        attempt: u8,
+        peer_candidates: &[SocketAddr],
+    ) -> HolePunchAttempt {
+        let started_at = Instant::now();
+        let token = format!("{session_id}:{attempt}");
+        let hello_payload = format!("{PUNCH_HELLO_PREFIX}{token}");
+        let expected_ack = format!("{PUNCH_ACK_PREFIX}{token}");
+        let timeout =
+            Duration::from_secs(u64::from(self.traversal_policy.direct_connect_timeout_secs));
+
+        let mut send_errors = Vec::new();
+        let mut ack_endpoint = None;
+        let peer_set = peer_candidates.iter().copied().collect::<HashSet<_>>();
+        let mut receive_buffer = [0_u8; MAX_PUNCH_PACKET_BYTES];
+
+        if !peer_candidates.is_empty() {
+            let deadline = tokio::time::Instant::now() + timeout;
+            let mut interval =
+                tokio::time::interval(Duration::from_millis(DEFAULT_PUNCH_RETRY_INTERVAL_MS));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+            'punch: loop {
+                tokio::select! {
+                    _ = tokio::time::sleep_until(deadline) => {
+                        break 'punch;
+                    }
+                    _ = interval.tick() => {
+                        for endpoint in peer_candidates {
+                            if let Err(error) = socket.send_to(hello_payload.as_bytes(), endpoint).await {
+                                send_errors.push(format!("send to {endpoint} failed: {error}"));
+                            }
+                        }
+                    }
+                    packet = socket.recv_from(&mut receive_buffer) => {
+                        let (size, from) = match packet {
+                            Ok(value) => value,
+                            Err(error) => {
+                                send_errors.push(format!("recv failed: {error}"));
+                                break 'punch;
+                            }
+                        };
+
+                        if !peer_set.contains(&from) {
+                            continue;
+                        }
+
+                        let payload = match std::str::from_utf8(&receive_buffer[..size]) {
+                            Ok(value) => value.trim(),
+                            Err(_) => continue,
+                        };
+
+                        if let Some(received_token) = payload.strip_prefix(PUNCH_HELLO_PREFIX) {
+                            let ack_payload = format!("{PUNCH_ACK_PREFIX}{received_token}");
+                            if let Err(error) = socket.send_to(ack_payload.as_bytes(), from).await {
+                                send_errors.push(format!("ack send to {from} failed: {error}"));
+                            }
+                            continue;
+                        }
+
+                        if payload == expected_ack {
+                            ack_endpoint = Some(from);
+                            break 'punch;
+                        }
+                    }
+                }
+            }
+        }
+
+        let latency_ms = ack_endpoint.map(|_| {
+            let elapsed = started_at.elapsed().as_millis().min(u128::from(u32::MAX));
+            elapsed as u32
+        });
+
+        HolePunchAttempt {
+            attempt,
+            peer_candidates: peer_candidates.to_vec(),
+            ack_endpoint,
+            acknowledged: ack_endpoint.is_some(),
+            latency_ms,
+            send_errors,
+        }
+    }
+
     pub async fn run_session_negotiation(
         &self,
         control_plane: &ControlPlaneClient,
@@ -627,13 +779,32 @@ impl AgentService {
             }
         };
 
+        if session.state != SessionState::NegotiatingDirect {
+            return Ok(NegotiationRunSummary {
+                session_id: session.session_id,
+                final_state: session.state,
+                final_path: session.path,
+                final_reason: session.reason,
+                attempts_sent: 0,
+                last_report: None,
+                last_candidates: Vec::new(),
+                hole_punch: None,
+            });
+        }
+
+        let socket = tokio::net::UdpSocket::bind(self.stun_probe_bind_addr()?).await?;
+
         let mut attempts_sent = 0;
         let mut last_report = None;
         let mut last_candidates = Vec::new();
         let mut cached_observations = Vec::new();
+        let mut punch_attempts = Vec::new();
 
         for attempt in 1..=self.traversal_policy.max_hole_punch_attempts {
-            let observations = match self.collect_nat_observations(&probe_plan).await {
+            let observations = match self
+                .collect_nat_observations_with_socket(&probe_plan, &socket)
+                .await
+            {
                 Ok(current) => {
                     cached_observations = current.clone();
                     current
@@ -658,13 +829,21 @@ impl AgentService {
                 .await?;
             last_candidates = candidates.clone();
 
+            let endpoint_bundles = control_plane.list_endpoint_candidates(network_id).await?;
+            let peer_candidates = extract_peer_candidates(&endpoint_bundles, peer_username);
+            let punch_attempt = self
+                .run_hole_punch_attempt(&socket, session.session_id, attempt, &peer_candidates)
+                .await;
+
             let nat_type = infer_nat_type(&observations);
-            let direct_ready = !candidates.is_empty() && nat_type != NatType::Symmetric;
+            let direct_ready = punch_attempt.acknowledged;
+            punch_attempts.push(punch_attempt);
+
             let report = build_session_report(
                 &self.traversal_policy,
                 attempt,
                 candidates.len(),
-                direct_ready,
+                direct_ready && nat_type != NatType::Symmetric,
                 &observations,
             )?;
 
@@ -690,6 +869,11 @@ impl AgentService {
                 .await?;
         }
 
+        let hole_punch = HolePunchTelemetry {
+            success: punch_attempts.iter().any(|attempt| attempt.acknowledged),
+            attempts: punch_attempts,
+        };
+
         Ok(NegotiationRunSummary {
             session_id: session.session_id,
             final_state: session.state,
@@ -698,9 +882,9 @@ impl AgentService {
             attempts_sent,
             last_report,
             last_candidates,
+            hole_punch: Some(hole_punch),
         })
     }
-
     fn stun_probe_bind_addr(&self) -> Result<SocketAddr, AgentError> {
         let configured =
             SocketAddr::from_str(self.config.local_bind_addr.trim()).map_err(|_| {
@@ -734,6 +918,41 @@ fn dedupe_endpoint_candidates(observations: &[NatObservation]) -> Vec<SocketAddr
     candidates
 }
 
+fn extract_peer_candidates(
+    bundles: &[PeerEndpointBundleResponse],
+    peer_username: &str,
+) -> Vec<SocketAddr> {
+    let target = peer_username.trim().to_ascii_lowercase();
+    let mut seen = HashSet::new();
+    let mut candidates = Vec::new();
+
+    for bundle in bundles {
+        if bundle.username.trim().to_ascii_lowercase() != target {
+            continue;
+        }
+
+        for candidate in &bundle.candidates {
+            match candidate.endpoint.trim().parse::<SocketAddr>() {
+                Ok(endpoint) => {
+                    if seen.insert(endpoint) {
+                        candidates.push(endpoint);
+                    }
+                }
+                Err(_) => {
+                    warn!(
+                        peer_username = %bundle.username,
+                        endpoint = %candidate.endpoint,
+                        "ignoring malformed peer endpoint candidate"
+                    );
+                }
+            }
+        }
+
+        break;
+    }
+
+    candidates
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -848,6 +1067,46 @@ mod tests {
         assert_eq!(deduped, vec![shared, second]);
     }
 
+    #[test]
+    fn extract_peer_candidates_filters_by_peer_and_parses_endpoints() {
+        let bundles = vec![
+            PeerEndpointBundleResponse {
+                username: "alice".to_owned(),
+                _public_key: "alice-key".to_owned(),
+                candidates: vec![EndpointCandidateResponse {
+                    endpoint: "198.51.100.10:51820".to_owned(),
+                    _observed_at: Utc::now(),
+                }],
+            },
+            PeerEndpointBundleResponse {
+                username: "bob".to_owned(),
+                _public_key: "bob-key".to_owned(),
+                candidates: vec![
+                    EndpointCandidateResponse {
+                        endpoint: "203.0.113.33:51820".to_owned(),
+                        _observed_at: Utc::now(),
+                    },
+                    EndpointCandidateResponse {
+                        endpoint: "203.0.113.33:51820".to_owned(),
+                        _observed_at: Utc::now(),
+                    },
+                    EndpointCandidateResponse {
+                        endpoint: "invalid-endpoint".to_owned(),
+                        _observed_at: Utc::now(),
+                    },
+                ],
+            },
+        ];
+
+        let endpoints = extract_peer_candidates(&bundles, "Bob");
+        assert_eq!(endpoints.len(), 1);
+
+        let only = match endpoints.first() {
+            Some(value) => value,
+            None => return,
+        };
+        assert_eq!(only.to_string(), "203.0.113.33:51820");
+    }
     #[test]
     fn stun_probe_bind_addr_rewrites_loopback_interface() {
         let db_path = std::env::temp_dir().join(format!("kakachi-agent-{}.db", Uuid::new_v4()));

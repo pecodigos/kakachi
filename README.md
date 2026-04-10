@@ -182,14 +182,14 @@ curl -sS http://127.0.0.1:8080/v1/networks/<network-id>/sessions/<session-id> -H
 - API currently runs over HTTP locally; TLS termination and cert management still required for deployment.
 - Coordination persistence currently uses a single-node SQLite file without schema migrations yet.
 - Session negotiation state now decides direct-vs-relay deterministically, but live UDP hole-punch execution is not wired yet.
-- Agent one-shot negotiation now performs live STUN transactions and reports NAT observations, but direct UDP punch packets are not exchanged yet.
+- Agent negotiation now performs live STUN transactions plus UDP hello/ack hole-punch attempts with telemetry, but sustained tunnel health checks are not wired yet.
 - Relay packet forwarding is still pending; current relay requirement is signaling only.
 - Desktop app now supports auth, network, peer, and session negotiation workflows through Tauri IPC, but chat and tunnel lifecycle UX are still pending.
 
 ## Next Slice
 
 - Add migration/versioning flow for coordination schema and backup/restore tooling.
-- Integrate direct UDP hole-punch packet exchange and connect-time health checks.
+- Add connect-time health checks and retry strategy tuning for direct UDP punch sessions.
 - Implement deterministic relay path for VPN packets and chat payload transport.
 - Expand desktop UI to include connection telemetry, chat transport, and tunnel lifecycle controls.
 

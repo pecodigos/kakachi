@@ -67,6 +67,21 @@ export interface NegotiationRunSummary {
     direct_ready: boolean;
   } | null;
   last_candidates: string[];
+  hole_punch: HolePunchTelemetry | null;
+}
+
+export interface HolePunchAttempt {
+  attempt: number;
+  peer_candidates: string[];
+  ack_endpoint: string | null;
+  acknowledged: boolean;
+  latency_ms: number | null;
+  send_errors: string[];
+}
+
+export interface HolePunchTelemetry {
+  success: boolean;
+  attempts: HolePunchAttempt[];
 }
 
 export interface ApiIdentity {
