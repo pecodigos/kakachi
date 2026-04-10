@@ -25,6 +25,8 @@ pub enum NetError {
     InvalidStunServer,
     #[error("too many STUN servers, max allowed is {MAX_STUN_SERVERS}")]
     TooManyStunServers,
+    #[error("at least one STUN server is required")]
+    MissingStunServers,
     #[error("invalid session report: {0}")]
     InvalidSessionReport(&'static str),
 }
@@ -115,6 +117,65 @@ pub struct SessionReport {
 pub struct SessionDecision {
     pub path: ConnectivityPath,
     pub reason: DecisionReason,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StunProbePlan {
+    pub servers: Vec<StunServer>,
+    pub probe_timeout_secs: u16,
+}
+
+pub fn build_stun_probe_plan(
+    policy: &TraversalPolicy,
+    raw_servers: &[String],
+) -> Result<StunProbePlan, NetError> {
+    policy.validate()?;
+    let servers = parse_stun_servers(raw_servers)?;
+    if servers.is_empty() {
+        return Err(NetError::MissingStunServers);
+    }
+
+    Ok(StunProbePlan {
+        servers,
+        probe_timeout_secs: policy.direct_connect_timeout_secs,
+    })
+}
+
+pub fn infer_nat_type(observations: &[NatObservation]) -> NatType {
+    if observations.is_empty() {
+        return NatType::Unknown;
+    }
+
+    let first = observations[0].observed_addr;
+    let stable_mapping = observations
+        .iter()
+        .all(|entry| entry.observed_addr == first);
+
+    if stable_mapping {
+        NatType::RestrictedCone
+    } else {
+        NatType::Symmetric
+    }
+}
+
+pub fn build_session_report(
+    policy: &TraversalPolicy,
+    attempt: u8,
+    candidate_count: usize,
+    direct_ready: bool,
+    observations: &[NatObservation],
+) -> Result<SessionReport, NetError> {
+    let candidate_count_u8 = u8::try_from(candidate_count)
+        .map_err(|_| NetError::InvalidSessionReport("candidate_count exceeds u8::MAX"))?;
+
+    let report = SessionReport {
+        nat_type: infer_nat_type(observations),
+        attempt,
+        candidate_count: candidate_count_u8,
+        direct_ready,
+    };
+    validate_session_report(policy, &report)?;
+    Ok(report)
 }
 
 pub fn decide_session_path(
@@ -328,5 +389,66 @@ mod tests {
 
         assert_eq!(decision.path, ConnectivityPath::Direct);
         assert_eq!(decision.reason, DecisionReason::DirectReady);
+    }
+
+    #[test]
+    fn build_stun_probe_plan_rejects_empty_server_list() {
+        let policy = TraversalPolicy::default();
+        let plan = build_stun_probe_plan(&policy, &[]);
+        assert!(plan.is_err());
+    }
+
+    #[test]
+    fn infer_nat_type_detects_symmetric_when_mapping_changes() {
+        let first_addr = match "198.51.100.11:51820".parse::<SocketAddr>() {
+            Ok(value) => value,
+            Err(error) => panic!("failed to parse first addr: {error}"),
+        };
+        let second_addr = match "198.51.100.11:51821".parse::<SocketAddr>() {
+            Ok(value) => value,
+            Err(error) => panic!("failed to parse second addr: {error}"),
+        };
+
+        let observations = vec![
+            NatObservation {
+                observed_addr: first_addr,
+                nat_type: NatType::Unknown,
+                recorded_at: Utc::now(),
+            },
+            NatObservation {
+                observed_addr: second_addr,
+                nat_type: NatType::Unknown,
+                recorded_at: Utc::now(),
+            },
+        ];
+
+        let inferred = infer_nat_type(&observations);
+        assert_eq!(inferred, NatType::Symmetric);
+    }
+
+    #[test]
+    fn build_session_report_generates_valid_payload() {
+        let addr = match "198.51.100.44:51820".parse::<SocketAddr>() {
+            Ok(value) => value,
+            Err(error) => panic!("failed to parse addr: {error}"),
+        };
+
+        let observations = vec![NatObservation {
+            observed_addr: addr,
+            nat_type: NatType::Unknown,
+            recorded_at: Utc::now(),
+        }];
+
+        let report = build_session_report(&TraversalPolicy::default(), 1, 2, false, &observations);
+        assert!(report.is_ok());
+
+        let report = if let Ok(value) = report {
+            value
+        } else {
+            return;
+        };
+        assert_eq!(report.nat_type, NatType::RestrictedCone);
+        assert_eq!(report.attempt, 1);
+        assert_eq!(report.candidate_count, 2);
     }
 }

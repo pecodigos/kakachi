@@ -114,6 +114,7 @@ cargo run -p kakachi-agent --bin agentd
 - API currently runs over HTTP locally; TLS termination and cert management still required for deployment.
 - Coordination persistence currently uses a single-node SQLite file without schema migrations yet.
 - Session negotiation state now decides direct-vs-relay deterministically, but live UDP hole-punch execution is not wired yet.
+- Core networking now includes STUN probe planning and NAT-based session report synthesis, but no live STUN transactions yet.
 - Relay packet forwarding is still pending; current relay requirement is signaling only.
 - Desktop UI is not started yet (planned for Tauri + React in Phase 3).
 
