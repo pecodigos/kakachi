@@ -11,6 +11,7 @@ Current responsibilities:
 - Guided friend connect flow for LAN-style use and remote VPN-style use
 - One-click `Quick connect` that ranks typed friend, preferred friend, then best online candidate
 - Peer presence hints (`online`, `recent`, `unknown`) based on endpoint candidate freshness
+- Last-seen timing hints in manual peer list (for example `active now`, `2m ago`, `1h ago`)
 - Live STUN-backed negotiation trigger via local agent service, including UDP hole-punch hello/ack telemetry
 
 ## Architecture Boundary
@@ -66,6 +67,7 @@ npm run tauri dev
 4. After login, create a network or join with invite code.
 5. Choose LAN game/app or Remote VPN mode.
 6. Press `Quick connect`.
+7. If Kakachi auto-selects a friend, confirm before connecting.
 
 Manual friend selection is available under `Manual friend selection`.
 Quick connect learns your last successful friend per network and prefers that friend when available.

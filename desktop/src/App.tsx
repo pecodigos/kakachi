@@ -20,6 +20,8 @@ import {
 
 type AuthView = "login" | "register";
 type PresenceState = "online" | "recent" | "unknown";
+type SecureStorageState = "unknown" | "available" | "unavailable";
+type QuickConnectSelectionSource = "typed" | "preferred" | "ranked";
 
 interface PresenceHint {
   state: PresenceState;
@@ -151,6 +153,37 @@ function presenceLabel(state: PresenceState): string {
   return "unknown";
 }
 
+function presenceTimeLabel(hint: PresenceHint | undefined): string {
+  if (!hint) {
+    return "status unavailable";
+  }
+
+  if (hint.state === "online") {
+    return "active now";
+  }
+
+  if (hint.ageSeconds === null) {
+    return "last seen unknown";
+  }
+
+  if (hint.ageSeconds < 60) {
+    return `${hint.ageSeconds}s ago`;
+  }
+
+  const minutes = Math.floor(hint.ageSeconds / 60);
+  if (minutes < 60) {
+    return `${minutes}m ago`;
+  }
+
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) {
+    return `${hours}h ago`;
+  }
+
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
+}
+
 function buildPresenceHints(endpointBundles: PeerEndpointBundle[]): Record<string, PresenceHint> {
   const nowMs = Date.now();
   const hints: Record<string, PresenceHint> = {};
@@ -194,15 +227,18 @@ function chooseQuickConnectPeer(
   requestedPeer: string,
   preferredPeer: string | null,
   presenceHints: Record<string, PresenceHint>
-): string {
+): { username: string; source: QuickConnectSelectionSource } {
   const requested = requestedPeer.trim();
 
   if (requested && candidates.some((peer) => peer.username === requested)) {
-    return requested;
+    return { username: requested, source: "typed" };
   }
 
   if (preferredPeer && candidates.some((peer) => peer.username === preferredPeer)) {
-    return preferredPeer;
+    return {
+      username: preferredPeer,
+      source: "preferred"
+    };
   }
 
   const ranked = [...candidates].sort((a, b) => {
@@ -224,7 +260,10 @@ function chooseQuickConnectPeer(
     return a.username.localeCompare(b.username);
   });
 
-  return ranked[0].username;
+  return {
+    username: ranked[0].username,
+    source: "ranked"
+  };
 }
 
 export default function App() {
@@ -261,6 +300,7 @@ export default function App() {
 
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [secureStorageState, setSecureStorageState] = useState<SecureStorageState>("unknown");
 
   const canUseAuthedActions = accessToken.trim().length > 0 && currentUsername.trim().length > 0;
 
@@ -277,12 +317,14 @@ export default function App() {
         setSavedLogin(saved);
         setControlPlaneUrl(saved.control_plane_url);
         setLoginUsername(saved.username);
+        setSecureStorageState("available");
         setStatusMessage(`Saved login found for ${saved.username}.`);
       } catch {
         if (!active) {
           return;
         }
 
+        setSecureStorageState("unavailable");
         setStatusMessage("Secure saved login is unavailable. Sign in with username and password.");
       }
     }
@@ -357,6 +399,11 @@ export default function App() {
       onSuccess(value);
     } catch (err) {
       const technicalMessage = err instanceof Error ? err.message : "Unexpected error";
+      if (technicalMessage === "USER_CANCELLED") {
+        setStatusMessage(`${label} canceled.`);
+        return;
+      }
+
       const friendlyMessage = toFriendlyError(technicalMessage);
       setError(friendlyMessage);
       setStatusMessage(`${label} failed. ${friendlyMessage}`);
@@ -458,8 +505,10 @@ export default function App() {
 
           setSavedLogin(session);
           void saveLoginSession({ session }).catch(() => {
+            setSecureStorageState("unavailable");
             setStatusMessage("Signed in, but secure save login is unavailable on this device.");
           });
+          setSecureStorageState("available");
         } else {
           setSavedLogin(null);
           void clearLoginSession();
@@ -660,25 +709,37 @@ export default function App() {
         }
 
         const presenceHints = buildPresenceHints(endpointBundles);
-        const selectedPeer = chooseQuickConnectPeer(
+        const selection = chooseQuickConnectPeer(
           candidates,
           peerUsername,
           preferredPeers[networkId]?.username ?? null,
           presenceHints
         );
 
+        if (selection.source !== "typed") {
+          const sourceText =
+            selection.source === "preferred" ? "your preferred friend" : "the best online match";
+          const approved = window.confirm(
+            `Quick connect selected ${selection.username} (${sourceText}). Continue?`
+          );
+
+          if (!approved) {
+            throw new Error("USER_CANCELLED");
+          }
+        }
+
         const summary = await runSessionProbe({
           control_plane_url: controlPlaneUrl,
           access_token: accessToken,
           network_id: networkId,
-          peer_username: selectedPeer,
+          peer_username: selection.username,
           stun_servers: parsedStunServers,
           local_bind_addr: localBindAddr,
           session_id: runSummary?.session_id
         });
 
         return {
-          selectedPeer,
+          selectedPeer: selection.username,
           summary,
           peerList,
           presenceHints
@@ -835,6 +896,9 @@ export default function App() {
 
             {error ? <p className="banner error">{error}</p> : null}
             <p className="banner status">{statusMessage}</p>
+            <p className="inline-info">
+              Secure save login: {secureStorageState === "unknown" ? "checking..." : secureStorageState}.
+            </p>
           </section>
         </main>
       </div>
@@ -923,6 +987,7 @@ export default function App() {
               <p className="inline-info">
                 This picks the typed friend, then your preferred friend, then the best online candidate.
               </p>
+              <p className="inline-info">Kakachi asks for confirmation before auto-connecting to a selected friend.</p>
               {preferredPeer ? (
                 <p className="inline-info">
                   Preferred friend for this network: {preferredPeer.username}.
@@ -953,18 +1018,21 @@ export default function App() {
                     <p className="inline-info">No peers available yet.</p>
                   ) : (
                     visiblePeers.map((peer) => {
-                        const hint = peerPresence[peer.username];
-                        const status = hint?.state ?? "unknown";
-                        return (
-                          <button
-                            key={peer.username}
-                            className="peer-item"
-                            onClick={() => setPeerUsername(peer.username)}
-                          >
-                            <span>{peer.username}</span>
-                            <span className={`peer-presence ${status}`}>{presenceLabel(status)}</span>
-                          </button>
-                        );
+                      const hint = peerPresence[peer.username];
+                      const status = hint?.state ?? "unknown";
+                      return (
+                        <button
+                          key={peer.username}
+                          className="peer-item"
+                          onClick={() => setPeerUsername(peer.username)}
+                        >
+                          <span className="peer-details">
+                            <span className="peer-name">{peer.username}</span>
+                            <span className="peer-last-seen">{presenceTimeLabel(hint)}</span>
+                          </span>
+                          <span className={`peer-presence ${status}`}>{presenceLabel(status)}</span>
+                        </button>
+                      );
                     })
                   )}
                 </div>

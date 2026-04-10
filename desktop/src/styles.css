@@ -314,6 +314,21 @@ button:disabled {
   font-weight: 600;
 }
 
+.peer-details {
+  display: grid;
+  gap: 0.1rem;
+  text-align: left;
+}
+
+.peer-name {
+  font-weight: 700;
+}
+
+.peer-last-seen {
+  font-size: 0.72rem;
+  color: #4d6376;
+}
+
 .peer-item:hover {
   background: #e6f0f8;
 }
