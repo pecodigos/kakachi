@@ -68,6 +68,9 @@ Agent daemon:
 
 See server/api/.env.example for API env template.
 
+For simpler local runs without shell exports, use a root `.env` file.
+Template: `env.example`.
+
 ## Build, Lint, Test
 
 ```bash
@@ -79,7 +82,6 @@ cargo test --workspace
 ## Run Control Plane
 
 ```bash
-export KAKACHI_JWT_SECRET="replace-with-a-long-random-secret-at-least-32-characters"
 cargo run -p kakachi-api
 ```
 
@@ -147,7 +149,6 @@ cargo run -p kakachi-agent --bin agentd
 1. Start the control plane:
 
 ```bash
-export KAKACHI_JWT_SECRET="replace-with-a-long-random-secret-at-least-32-characters"
 cargo run -p kakachi-api
 ```
 

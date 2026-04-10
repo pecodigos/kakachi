@@ -518,6 +518,7 @@ fn init_tracing() {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let _ = dotenvy::dotenv();
     init_tracing();
 
     let state = match RuntimeState::from_env() {

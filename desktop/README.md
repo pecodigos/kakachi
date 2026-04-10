@@ -43,9 +43,11 @@ npm install
 
 ```bash
 cd /mnt/hdd/Code/rust
-export KAKACHI_JWT_SECRET="replace-with-a-long-random-secret-at-least-32-characters"
 cargo run -p kakachi-api
 ```
+
+Environment is loaded from root `.env` automatically.
+Template: `env.example`.
 
 2. Start desktop app in another terminal:
 
