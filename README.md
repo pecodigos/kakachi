@@ -7,6 +7,7 @@ This repository now contains the Phase 1 foundation:
 - Control plane server (HTTPS/WebSocket-ready API skeleton)
 - Core agent daemon crate with local SQLite state
 - Core networking, WireGuard, and chat domain crates
+- Desktop app (Tauri + React) with IPC bridge to control-plane and local agent services
 - Security-first defaults (input validation, key validation, no custom cryptography)
 
 ## Workspace Layout
@@ -17,7 +18,7 @@ This repository now contains the Phase 1 foundation:
 - core/chat: encrypted payload envelope model and transport metadata
 - server/coordination: auth and room membership coordination logic
 - server/api: Axum HTTP/WebSocket control-plane API
-- desktop: reserved for Tauri + React app (Phase 3)
+- desktop: Tauri + React desktop UI and IPC backend
 
 ## Security Baseline In This Phase
 
@@ -93,6 +94,16 @@ curl http://127.0.0.1:8080/healthz
 ```bash
 cargo run -p kakachi-agent --bin agentd
 ```
+
+## Run Desktop App
+
+```bash
+cd desktop
+npm install
+npm run tauri dev
+```
+
+Desktop setup and flow details: [desktop/README.md](desktop/README.md)
 
 ### Run One-Shot Session Negotiation
 
@@ -173,13 +184,14 @@ curl -sS http://127.0.0.1:8080/v1/networks/<network-id>/sessions/<session-id> -H
 - Session negotiation state now decides direct-vs-relay deterministically, but live UDP hole-punch execution is not wired yet.
 - Agent one-shot negotiation now performs live STUN transactions and reports NAT observations, but direct UDP punch packets are not exchanged yet.
 - Relay packet forwarding is still pending; current relay requirement is signaling only.
-- Desktop UI is not started yet (planned for Tauri + React in Phase 3).
+- Desktop app now supports auth, network, peer, and session negotiation workflows through Tauri IPC, but chat and tunnel lifecycle UX are still pending.
 
 ## Next Slice
 
 - Add migration/versioning flow for coordination schema and backup/restore tooling.
 - Integrate direct UDP hole-punch packet exchange and connect-time health checks.
 - Implement deterministic relay path for VPN packets and chat payload transport.
+- Expand desktop UI to include connection telemetry, chat transport, and tunnel lifecycle controls.
 
 ## Project Governance
 

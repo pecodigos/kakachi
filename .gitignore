@@ -24,3 +24,10 @@
 
 # VS Code workspace-specific state
 .vscode/
+
+# Desktop frontend artifacts
+desktop/node_modules/
+desktop/dist/
+
+# Tauri desktop build artifacts
+desktop/src-tauri/target/
