@@ -104,19 +104,23 @@ cargo run -p kakachi-agent --bin agentd
 - GET /v1/networks/{network_id}/peers
 - POST /v1/networks/{network_id}/endpoint-candidates
 - GET /v1/networks/{network_id}/endpoint-candidates
+- POST /v1/networks/{network_id}/sessions
+- GET /v1/networks/{network_id}/sessions/{session_id}
+- POST /v1/networks/{network_id}/sessions/{session_id}/report
 - GET /v1/ws?token=<jwt>&network_id=<uuid>
 
 ## Current Risks And Gaps
 
 - API currently runs over HTTP locally; TLS termination and cert management still required for deployment.
 - Coordination persistence currently uses a single-node SQLite file without schema migrations yet.
-- NAT endpoint metadata exchange exists, but direct hole-punching and relay packet forwarding are not fully wired yet.
+- Session negotiation state now decides direct-vs-relay deterministically, but live UDP hole-punch execution is not wired yet.
+- Relay packet forwarding is still pending; current relay requirement is signaling only.
 - Desktop UI is not started yet (planned for Tauri + React in Phase 3).
 
 ## Next Slice
 
 - Add migration/versioning flow for coordination schema and backup/restore tooling.
-- Introduce DTLS/QUIC or UDP session manager for direct peer session establishment.
+- Integrate STUN queries and real UDP hole-punch workflow in core/net and agent daemon.
 - Implement deterministic relay path for VPN packets and chat payload transport.
 
 ## Project Governance

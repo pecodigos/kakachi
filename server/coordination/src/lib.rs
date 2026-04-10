@@ -9,6 +9,10 @@ use argon2::{Argon2, PasswordVerifier};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use chrono::{DateTime, Utc};
+use kakachi_net::{
+    ConnectivityPath, DecisionReason, NatType, NetError, SessionReport, TraversalPolicy,
+    decide_session_path,
+};
 use rand::rngs::OsRng;
 use regex::Regex;
 use rusqlite::{Connection, params};
@@ -22,6 +26,7 @@ const MIN_PASSWORD_LEN: usize = 12;
 const MAX_NETWORK_NAME_LEN: usize = 64;
 const MAX_ENDPOINT_CANDIDATES: usize = 12;
 const ENDPOINT_CANDIDATE_TTL_SECS: i64 = 300;
+const DEFAULT_SESSION_MAX_ATTEMPTS: u8 = 6;
 
 #[derive(Debug, Error)]
 pub enum CoordinationError {
@@ -41,6 +46,12 @@ pub enum CoordinationError {
     InvalidNetworkName,
     #[error("network not found")]
     NetworkNotFound,
+    #[error("session not found")]
+    SessionNotFound,
+    #[error("session participants must be different and members of the same network")]
+    InvalidSessionParticipants,
+    #[error("invalid session report: {0}")]
+    InvalidSessionReport(&'static str),
     #[error("requester is not a member of this network")]
     AccessDenied,
     #[error("internal state is inconsistent")]
@@ -118,6 +129,80 @@ pub struct PeerEndpointBundle {
     pub candidates: Vec<EndpointCandidate>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionState {
+    NegotiatingDirect,
+    DirectReady,
+    RelayRequired,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionNatType {
+    Unknown,
+    FullCone,
+    RestrictedCone,
+    PortRestrictedCone,
+    Symmetric,
+}
+
+impl From<SessionNatType> for NatType {
+    fn from(value: SessionNatType) -> Self {
+        match value {
+            SessionNatType::Unknown => NatType::Unknown,
+            SessionNatType::FullCone => NatType::FullCone,
+            SessionNatType::RestrictedCone => NatType::RestrictedCone,
+            SessionNatType::PortRestrictedCone => NatType::PortRestrictedCone,
+            SessionNatType::Symmetric => NatType::Symmetric,
+        }
+    }
+}
+
+impl From<NatType> for SessionNatType {
+    fn from(value: NatType) -> Self {
+        match value {
+            NatType::Unknown => SessionNatType::Unknown,
+            NatType::FullCone => SessionNatType::FullCone,
+            NatType::RestrictedCone => SessionNatType::RestrictedCone,
+            NatType::PortRestrictedCone => SessionNatType::PortRestrictedCone,
+            NatType::Symmetric => SessionNatType::Symmetric,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionProgressInput {
+    pub nat_type: SessionNatType,
+    pub attempt: u8,
+    pub candidate_count: u8,
+    pub direct_ready: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionPeerReport {
+    pub username: String,
+    pub nat_type: SessionNatType,
+    pub attempt: u8,
+    pub candidate_count: u8,
+    pub direct_ready: bool,
+    pub reported_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionNegotiationSummary {
+    pub session_id: Uuid,
+    pub network_id: Uuid,
+    pub initiator: String,
+    pub responder: String,
+    pub state: SessionState,
+    pub path: ConnectivityPath,
+    pub reason: DecisionReason,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub reports: Vec<SessionPeerReport>,
+}
+
 #[derive(Debug, Clone)]
 struct UserRecord {
     username: String,
@@ -141,6 +226,31 @@ struct EndpointCandidateRecord {
     observed_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone)]
+struct SessionReportRecord {
+    nat_type: NatType,
+    attempt: u8,
+    candidate_count: u8,
+    direct_ready: bool,
+    reported_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+struct SessionRecord {
+    session_id: Uuid,
+    network_id: Uuid,
+    initiator_lookup: String,
+    responder_lookup: String,
+    state: SessionState,
+    path: ConnectivityPath,
+    reason: DecisionReason,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    policy: TraversalPolicy,
+    initiator_report: Option<SessionReportRecord>,
+    responder_report: Option<SessionReportRecord>,
+}
+
 impl From<EndpointCandidateRecord> for EndpointCandidate {
     fn from(value: EndpointCandidateRecord) -> Self {
         Self {
@@ -155,6 +265,7 @@ struct LoadedState {
     users: HashMap<String, UserRecord>,
     networks: HashMap<Uuid, NetworkRecord>,
     endpoint_candidates: HashMap<(Uuid, String), Vec<EndpointCandidateRecord>>,
+    sessions: HashMap<Uuid, SessionRecord>,
 }
 
 #[derive(Debug, Clone)]
@@ -387,6 +498,7 @@ impl SqliteCoordinationStorage {
                 users,
                 networks,
                 endpoint_candidates,
+                sessions: HashMap::new(),
             })
         })
     }
@@ -520,6 +632,7 @@ pub struct ControlPlaneState {
     users: RwLock<HashMap<String, UserRecord>>,
     networks: RwLock<HashMap<Uuid, NetworkRecord>>,
     endpoint_candidates: RwLock<HashMap<(Uuid, String), Vec<EndpointCandidateRecord>>>,
+    sessions: RwLock<HashMap<Uuid, SessionRecord>>,
     storage: Option<SqliteCoordinationStorage>,
 }
 
@@ -536,6 +649,7 @@ impl ControlPlaneState {
             users: RwLock::new(snapshot.users),
             networks: RwLock::new(snapshot.networks),
             endpoint_candidates: RwLock::new(snapshot.endpoint_candidates),
+            sessions: RwLock::new(snapshot.sessions),
             storage: Some(storage),
         })
     }
@@ -837,6 +951,249 @@ impl ControlPlaneState {
         bundles.sort_by(|left, right| left.username.cmp(&right.username));
         Ok(bundles)
     }
+
+    pub async fn open_session_negotiation(
+        &self,
+        network_id: Uuid,
+        initiator_username: &str,
+        responder_username: &str,
+    ) -> Result<SessionNegotiationSummary, CoordinationError> {
+        let initiator_lookup = normalize_lookup(initiator_username);
+        let responder_lookup = normalize_lookup(responder_username);
+        if initiator_lookup == responder_lookup {
+            return Err(CoordinationError::InvalidSessionParticipants);
+        }
+
+        {
+            let networks = self.networks.read().await;
+            let network = networks
+                .get(&network_id)
+                .ok_or(CoordinationError::NetworkNotFound)?;
+
+            let initiator_is_member = network.member_usernames_lookup.contains(&initiator_lookup);
+            let responder_is_member = network.member_usernames_lookup.contains(&responder_lookup);
+            if !initiator_is_member || !responder_is_member {
+                return Err(CoordinationError::InvalidSessionParticipants);
+            }
+        }
+
+        let now = Utc::now();
+        let record = SessionRecord {
+            session_id: Uuid::new_v4(),
+            network_id,
+            initiator_lookup: initiator_lookup.clone(),
+            responder_lookup,
+            state: SessionState::NegotiatingDirect,
+            path: ConnectivityPath::Direct,
+            reason: DecisionReason::AwaitingReports,
+            created_at: now,
+            updated_at: now,
+            policy: TraversalPolicy {
+                max_hole_punch_attempts: DEFAULT_SESSION_MAX_ATTEMPTS,
+                ..TraversalPolicy::default()
+            },
+            initiator_report: None,
+            responder_report: None,
+        };
+
+        let mut sessions = self.sessions.write().await;
+        sessions.insert(record.session_id, record.clone());
+        drop(sessions);
+
+        self.build_session_summary(&record, &initiator_lookup).await
+    }
+
+    pub async fn report_session_progress(
+        &self,
+        network_id: Uuid,
+        session_id: Uuid,
+        reporter_username: &str,
+        progress: SessionProgressInput,
+    ) -> Result<SessionNegotiationSummary, CoordinationError> {
+        let reporter_lookup = normalize_lookup(reporter_username);
+
+        let mut sessions = self.sessions.write().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .ok_or(CoordinationError::SessionNotFound)?;
+
+        if session.network_id != network_id {
+            return Err(CoordinationError::SessionNotFound);
+        }
+
+        let is_participant = reporter_lookup == session.initiator_lookup
+            || reporter_lookup == session.responder_lookup;
+        if !is_participant {
+            return Err(CoordinationError::AccessDenied);
+        }
+
+        let report = SessionReportRecord {
+            nat_type: progress.nat_type.into(),
+            attempt: progress.attempt,
+            candidate_count: progress.candidate_count,
+            direct_ready: progress.direct_ready,
+            reported_at: Utc::now(),
+        };
+
+        if reporter_lookup == session.initiator_lookup {
+            session.initiator_report = Some(report);
+        } else {
+            session.responder_report = Some(report);
+        }
+
+        apply_session_decision(session)?;
+        session.updated_at = Utc::now();
+        let snapshot = session.clone();
+        drop(sessions);
+
+        self.build_session_summary(&snapshot, &reporter_lookup)
+            .await
+    }
+
+    pub async fn get_session_negotiation(
+        &self,
+        network_id: Uuid,
+        session_id: Uuid,
+        requester_username: &str,
+    ) -> Result<SessionNegotiationSummary, CoordinationError> {
+        let requester_lookup = normalize_lookup(requester_username);
+        let sessions = self.sessions.read().await;
+        let session = sessions
+            .get(&session_id)
+            .ok_or(CoordinationError::SessionNotFound)?;
+
+        if session.network_id != network_id {
+            return Err(CoordinationError::SessionNotFound);
+        }
+
+        self.build_session_summary(session, &requester_lookup).await
+    }
+
+    async fn build_session_summary(
+        &self,
+        session: &SessionRecord,
+        requester_lookup: &str,
+    ) -> Result<SessionNegotiationSummary, CoordinationError> {
+        let is_participant = requester_lookup == session.initiator_lookup
+            || requester_lookup == session.responder_lookup;
+        if !is_participant {
+            return Err(CoordinationError::AccessDenied);
+        }
+
+        let users = self.users.read().await;
+        let initiator = users
+            .get(&session.initiator_lookup)
+            .ok_or(CoordinationError::InconsistentState)?;
+        let responder = users
+            .get(&session.responder_lookup)
+            .ok_or(CoordinationError::InconsistentState)?;
+
+        let mut reports = Vec::new();
+        if let Some(report) = &session.initiator_report {
+            reports.push(SessionPeerReport {
+                username: initiator.username.clone(),
+                nat_type: SessionNatType::from(report.nat_type),
+                attempt: report.attempt,
+                candidate_count: report.candidate_count,
+                direct_ready: report.direct_ready,
+                reported_at: report.reported_at,
+            });
+        }
+
+        if let Some(report) = &session.responder_report {
+            reports.push(SessionPeerReport {
+                username: responder.username.clone(),
+                nat_type: SessionNatType::from(report.nat_type),
+                attempt: report.attempt,
+                candidate_count: report.candidate_count,
+                direct_ready: report.direct_ready,
+                reported_at: report.reported_at,
+            });
+        }
+
+        Ok(SessionNegotiationSummary {
+            session_id: session.session_id,
+            network_id: session.network_id,
+            initiator: initiator.username.clone(),
+            responder: responder.username.clone(),
+            state: session.state,
+            path: session.path,
+            reason: session.reason,
+            created_at: session.created_at,
+            updated_at: session.updated_at,
+            reports,
+        })
+    }
+}
+
+fn apply_session_decision(session: &mut SessionRecord) -> Result<(), CoordinationError> {
+    let decision = match (&session.initiator_report, &session.responder_report) {
+        (Some(initiator), Some(responder)) => {
+            let initiator_report = SessionReport {
+                nat_type: initiator.nat_type,
+                attempt: initiator.attempt,
+                candidate_count: initiator.candidate_count,
+                direct_ready: initiator.direct_ready,
+            };
+            let responder_report = SessionReport {
+                nat_type: responder.nat_type,
+                attempt: responder.attempt,
+                candidate_count: responder.candidate_count,
+                direct_ready: responder.direct_ready,
+            };
+
+            decide_session_path(&session.policy, &initiator_report, &responder_report).map_err(
+                |err| match err {
+                    NetError::InvalidSessionReport(message) => {
+                        CoordinationError::InvalidSessionReport(message)
+                    }
+                    _ => CoordinationError::InconsistentState,
+                },
+            )?
+        }
+        (Some(report), None) | (None, Some(report)) => {
+            if report.nat_type == NatType::Symmetric {
+                kakachi_net::SessionDecision {
+                    path: ConnectivityPath::Relay,
+                    reason: DecisionReason::SymmetricNatDetected,
+                }
+            } else if report.candidate_count == 0 {
+                kakachi_net::SessionDecision {
+                    path: ConnectivityPath::Relay,
+                    reason: DecisionReason::MissingCandidates,
+                }
+            } else if report.attempt >= session.policy.max_hole_punch_attempts {
+                kakachi_net::SessionDecision {
+                    path: ConnectivityPath::Relay,
+                    reason: DecisionReason::MaxAttemptsExceeded,
+                }
+            } else {
+                kakachi_net::SessionDecision {
+                    path: ConnectivityPath::Direct,
+                    reason: DecisionReason::AwaitingReports,
+                }
+            }
+        }
+        (None, None) => kakachi_net::SessionDecision {
+            path: ConnectivityPath::Direct,
+            reason: DecisionReason::AwaitingReports,
+        },
+    };
+
+    session.path = decision.path;
+    session.reason = decision.reason;
+    session.state = match decision.path {
+        ConnectivityPath::Relay => SessionState::RelayRequired,
+        ConnectivityPath::Direct => {
+            if decision.reason == DecisionReason::DirectReady {
+                SessionState::DirectReady
+            } else {
+                SessionState::NegotiatingDirect
+            }
+        }
+    };
+
+    Ok(())
 }
 
 fn normalize_lookup(username: &str) -> String {
@@ -1100,6 +1457,149 @@ mod tests {
             .upsert_endpoint_candidates(network_id, "alice", &["not-an-endpoint".to_owned()])
             .await;
         assert!(update.is_err());
+    }
+
+    #[tokio::test]
+    async fn session_negotiation_reaches_direct_ready() {
+        let state = ControlPlaneState::new();
+        let alice_password = SecretString::new("ValidPassword123".to_owned());
+        let bob_password = SecretString::new("DifferentPass123".to_owned());
+
+        assert!(
+            state
+                .register_user("alice", &alice_password, &fixture_public_key(10))
+                .await
+                .is_ok()
+        );
+        assert!(
+            state
+                .register_user("bob", &bob_password, &fixture_public_key(11))
+                .await
+                .is_ok()
+        );
+
+        let network = state.create_network("alice", "friends").await;
+        assert!(network.is_ok());
+        let network_id = if let Ok(summary) = network {
+            summary.network_id
+        } else {
+            Uuid::nil()
+        };
+        assert_ne!(network_id, Uuid::nil());
+        assert!(state.join_network(network_id, "bob").await.is_ok());
+
+        let opened = state
+            .open_session_negotiation(network_id, "alice", "bob")
+            .await;
+        assert!(opened.is_ok());
+        let opened = if let Ok(value) = opened {
+            value
+        } else {
+            return;
+        };
+
+        let alice_report = state
+            .report_session_progress(
+                network_id,
+                opened.session_id,
+                "alice",
+                SessionProgressInput {
+                    nat_type: SessionNatType::RestrictedCone,
+                    attempt: 1,
+                    candidate_count: 2,
+                    direct_ready: true,
+                },
+            )
+            .await;
+        assert!(alice_report.is_ok());
+
+        let bob_report = state
+            .report_session_progress(
+                network_id,
+                opened.session_id,
+                "bob",
+                SessionProgressInput {
+                    nat_type: SessionNatType::RestrictedCone,
+                    attempt: 1,
+                    candidate_count: 2,
+                    direct_ready: true,
+                },
+            )
+            .await;
+        assert!(bob_report.is_ok());
+
+        let summary = if let Ok(value) = bob_report {
+            value
+        } else {
+            return;
+        };
+        assert_eq!(summary.state, SessionState::DirectReady);
+        assert_eq!(summary.path, ConnectivityPath::Direct);
+        assert_eq!(summary.reason, DecisionReason::DirectReady);
+    }
+
+    #[tokio::test]
+    async fn session_negotiation_requires_relay_for_symmetric_nat() {
+        let state = ControlPlaneState::new();
+        let alice_password = SecretString::new("ValidPassword123".to_owned());
+        let bob_password = SecretString::new("DifferentPass123".to_owned());
+
+        assert!(
+            state
+                .register_user("alice", &alice_password, &fixture_public_key(12))
+                .await
+                .is_ok()
+        );
+        assert!(
+            state
+                .register_user("bob", &bob_password, &fixture_public_key(13))
+                .await
+                .is_ok()
+        );
+
+        let network = state.create_network("alice", "friends").await;
+        assert!(network.is_ok());
+        let network_id = if let Ok(summary) = network {
+            summary.network_id
+        } else {
+            Uuid::nil()
+        };
+        assert_ne!(network_id, Uuid::nil());
+        assert!(state.join_network(network_id, "bob").await.is_ok());
+
+        let opened = state
+            .open_session_negotiation(network_id, "alice", "bob")
+            .await;
+        assert!(opened.is_ok());
+        let opened = if let Ok(value) = opened {
+            value
+        } else {
+            return;
+        };
+
+        let report = state
+            .report_session_progress(
+                network_id,
+                opened.session_id,
+                "alice",
+                SessionProgressInput {
+                    nat_type: SessionNatType::Symmetric,
+                    attempt: 1,
+                    candidate_count: 1,
+                    direct_ready: false,
+                },
+            )
+            .await;
+        assert!(report.is_ok());
+
+        let summary = if let Ok(value) = report {
+            value
+        } else {
+            return;
+        };
+        assert_eq!(summary.state, SessionState::RelayRequired);
+        assert_eq!(summary.path, ConnectivityPath::Relay);
+        assert_eq!(summary.reason, DecisionReason::SymmetricNatDetected);
     }
 
     #[tokio::test]

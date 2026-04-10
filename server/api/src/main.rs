@@ -11,7 +11,9 @@ use axum::{Json, Router};
 use chrono::{DateTime, Duration, Utc};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use kakachi_coordination::{
-    AuthenticatedUser, ControlPlaneState, CoordinationError, NetworkSummary, PeerIdentity,
+    AuthenticatedUser, ControlPlaneState, CoordinationError, EndpointCandidate, NetworkSummary,
+    PeerEndpointBundle, PeerIdentity, SessionNatType, SessionNegotiationSummary,
+    SessionProgressInput,
 };
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
@@ -35,6 +37,22 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/networks/{network_id}", get(get_network))
         .route("/v1/networks/{network_id}/join", post(join_network))
         .route("/v1/networks/{network_id}/peers", get(list_peers))
+        .route(
+            "/v1/networks/{network_id}/endpoint-candidates",
+            post(update_endpoint_candidates).get(list_endpoint_candidates),
+        )
+        .route(
+            "/v1/networks/{network_id}/sessions",
+            post(open_session_negotiation),
+        )
+        .route(
+            "/v1/networks/{network_id}/sessions/{session_id}",
+            get(get_session_negotiation),
+        )
+        .route(
+            "/v1/networks/{network_id}/sessions/{session_id}/report",
+            post(report_session_progress),
+        )
         .route("/v1/ws", get(ws_entry))
         .with_state(state)
         .layer(CorsLayer::permissive())
@@ -95,6 +113,24 @@ struct LoginResponse {
 #[derive(Debug, Deserialize)]
 struct CreateNetworkRequest {
     name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateEndpointCandidatesRequest {
+    candidates: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenSessionRequest {
+    peer_username: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionProgressRequest {
+    nat_type: SessionNatType,
+    attempt: u8,
+    candidate_count: u8,
+    direct_ready: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -235,13 +271,15 @@ fn map_coordination_error(err: CoordinationError) -> ApiError {
         | CoordinationError::InvalidPublicKey
         | CoordinationError::InvalidNetworkName
         | CoordinationError::InvalidEndpointCandidate
-        | CoordinationError::TooManyEndpointCandidates => ApiError::bad_request(err.to_string()),
+        | CoordinationError::TooManyEndpointCandidates
+        | CoordinationError::InvalidSessionParticipants
+        | CoordinationError::InvalidSessionReport(_) => ApiError::bad_request(err.to_string()),
         CoordinationError::UserAlreadyExists => ApiError::conflict(err.to_string()),
         CoordinationError::InvalidCredentials => ApiError::unauthorized(err.to_string()),
         CoordinationError::AccessDenied => ApiError::forbidden(err.to_string()),
-        CoordinationError::UserNotFound | CoordinationError::NetworkNotFound => {
-            ApiError::not_found(err.to_string())
-        }
+        CoordinationError::UserNotFound
+        | CoordinationError::NetworkNotFound
+        | CoordinationError::SessionNotFound => ApiError::not_found(err.to_string()),
         CoordinationError::InconsistentState
         | CoordinationError::PasswordHashFailure
         | CoordinationError::StorageFailure(_) => ApiError::internal("internal coordination error"),
@@ -358,6 +396,92 @@ async fn list_peers(
         .collect::<Vec<_>>();
 
     Ok(Json(serialized))
+}
+
+async fn update_endpoint_candidates(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(network_id): Path<Uuid>,
+    Json(request): Json<UpdateEndpointCandidatesRequest>,
+) -> Result<Json<Vec<EndpointCandidate>>, ApiError> {
+    let identity = authorize(&headers, &state)?;
+    let candidates = state
+        .control
+        .upsert_endpoint_candidates(network_id, &identity.username, &request.candidates)
+        .await
+        .map_err(map_coordination_error)?;
+
+    Ok(Json(candidates))
+}
+
+async fn list_endpoint_candidates(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(network_id): Path<Uuid>,
+) -> Result<Json<Vec<PeerEndpointBundle>>, ApiError> {
+    let identity = authorize(&headers, &state)?;
+    let bundles = state
+        .control
+        .list_network_endpoint_candidates(network_id, &identity.username)
+        .await
+        .map_err(map_coordination_error)?;
+
+    Ok(Json(bundles))
+}
+
+async fn open_session_negotiation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(network_id): Path<Uuid>,
+    Json(request): Json<OpenSessionRequest>,
+) -> Result<Json<SessionNegotiationSummary>, ApiError> {
+    let identity = authorize(&headers, &state)?;
+    let session = state
+        .control
+        .open_session_negotiation(network_id, &identity.username, &request.peer_username)
+        .await
+        .map_err(map_coordination_error)?;
+
+    Ok(Json(session))
+}
+
+async fn report_session_progress(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((network_id, session_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<SessionProgressRequest>,
+) -> Result<Json<SessionNegotiationSummary>, ApiError> {
+    let identity = authorize(&headers, &state)?;
+
+    let progress = SessionProgressInput {
+        nat_type: request.nat_type,
+        attempt: request.attempt,
+        candidate_count: request.candidate_count,
+        direct_ready: request.direct_ready,
+    };
+
+    let session = state
+        .control
+        .report_session_progress(network_id, session_id, &identity.username, progress)
+        .await
+        .map_err(map_coordination_error)?;
+
+    Ok(Json(session))
+}
+
+async fn get_session_negotiation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((network_id, session_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<SessionNegotiationSummary>, ApiError> {
+    let identity = authorize(&headers, &state)?;
+    let session = state
+        .control
+        .get_session_negotiation(network_id, session_id, &identity.username)
+        .await
+        .map_err(map_coordination_error)?;
+
+    Ok(Json(session))
 }
 
 async fn ws_entry(

@@ -7,6 +7,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 const MAX_NETWORK_NAME_LEN: usize = 64;
+const MAX_STUN_SERVERS: usize = 8;
 
 #[derive(Debug, Error)]
 pub enum NetError {
@@ -20,6 +21,12 @@ pub enum NetError {
     UnsupportedAddressFamily,
     #[error("traversal policy is invalid: {0}")]
     InvalidTraversalPolicy(&'static str),
+    #[error("invalid STUN server address")]
+    InvalidStunServer,
+    #[error("too many STUN servers, max allowed is {MAX_STUN_SERVERS}")]
+    TooManyStunServers,
+    #[error("invalid session report: {0}")]
+    InvalidSessionReport(&'static str),
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -51,6 +58,120 @@ pub struct TraversalPolicy {
     pub max_hole_punch_attempts: u8,
     pub direct_connect_timeout_secs: u16,
     pub relay_backoff_secs: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StunServer {
+    pub addr: SocketAddr,
+    pub priority: u8,
+}
+
+pub fn parse_stun_servers(raw_servers: &[String]) -> Result<Vec<StunServer>, NetError> {
+    if raw_servers.len() > MAX_STUN_SERVERS {
+        return Err(NetError::TooManyStunServers);
+    }
+
+    let mut servers = Vec::with_capacity(raw_servers.len());
+    for (index, raw) in raw_servers.iter().enumerate() {
+        let parsed = raw
+            .trim()
+            .parse::<SocketAddr>()
+            .map_err(|_| NetError::InvalidStunServer)?;
+        servers.push(StunServer {
+            addr: parsed,
+            priority: (index as u8) + 1,
+        });
+    }
+
+    Ok(servers)
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectivityPath {
+    Direct,
+    Relay,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionReason {
+    AwaitingReports,
+    DirectReady,
+    SymmetricNatDetected,
+    MissingCandidates,
+    MaxAttemptsExceeded,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionReport {
+    pub nat_type: NatType,
+    pub attempt: u8,
+    pub candidate_count: u8,
+    pub direct_ready: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionDecision {
+    pub path: ConnectivityPath,
+    pub reason: DecisionReason,
+}
+
+pub fn decide_session_path(
+    policy: &TraversalPolicy,
+    initiator: &SessionReport,
+    responder: &SessionReport,
+) -> Result<SessionDecision, NetError> {
+    policy.validate()?;
+    validate_session_report(policy, initiator)?;
+    validate_session_report(policy, responder)?;
+
+    if initiator.direct_ready && responder.direct_ready {
+        return Ok(SessionDecision {
+            path: ConnectivityPath::Direct,
+            reason: DecisionReason::DirectReady,
+        });
+    }
+
+    if initiator.nat_type == NatType::Symmetric || responder.nat_type == NatType::Symmetric {
+        return Ok(SessionDecision {
+            path: ConnectivityPath::Relay,
+            reason: DecisionReason::SymmetricNatDetected,
+        });
+    }
+
+    if initiator.candidate_count == 0 || responder.candidate_count == 0 {
+        return Ok(SessionDecision {
+            path: ConnectivityPath::Relay,
+            reason: DecisionReason::MissingCandidates,
+        });
+    }
+
+    let max_attempt = initiator.attempt.max(responder.attempt);
+    if max_attempt >= policy.max_hole_punch_attempts {
+        return Ok(SessionDecision {
+            path: ConnectivityPath::Relay,
+            reason: DecisionReason::MaxAttemptsExceeded,
+        });
+    }
+
+    Ok(SessionDecision {
+        path: ConnectivityPath::Direct,
+        reason: DecisionReason::AwaitingReports,
+    })
+}
+
+fn validate_session_report(
+    policy: &TraversalPolicy,
+    report: &SessionReport,
+) -> Result<(), NetError> {
+    if report.attempt == 0 || report.attempt > policy.max_hole_punch_attempts {
+        return Err(NetError::InvalidSessionReport(
+            "attempt must be in 1..=max_hole_punch_attempts",
+        ));
+    }
+
+    Ok(())
 }
 
 impl Default for TraversalPolicy {
@@ -145,5 +266,67 @@ mod tests {
     fn virtual_network_rejects_public_cidr() {
         let network = VirtualNetwork::new(Uuid::new_v4(), "public", "8.8.8.0/24");
         assert!(network.is_err());
+    }
+
+    #[test]
+    fn parse_stun_servers_rejects_invalid_addr() {
+        let servers = parse_stun_servers(&["bad-address".to_owned()]);
+        assert!(servers.is_err());
+    }
+
+    #[test]
+    fn decide_session_path_prefers_relay_for_symmetric_nat() {
+        let policy = TraversalPolicy::default();
+        let initiator = SessionReport {
+            nat_type: NatType::Symmetric,
+            attempt: 1,
+            candidate_count: 2,
+            direct_ready: false,
+        };
+        let responder = SessionReport {
+            nat_type: NatType::FullCone,
+            attempt: 1,
+            candidate_count: 2,
+            direct_ready: false,
+        };
+
+        let decision = decide_session_path(&policy, &initiator, &responder);
+        assert!(decision.is_ok());
+        let decision = if let Ok(value) = decision {
+            value
+        } else {
+            return;
+        };
+
+        assert_eq!(decision.path, ConnectivityPath::Relay);
+        assert_eq!(decision.reason, DecisionReason::SymmetricNatDetected);
+    }
+
+    #[test]
+    fn decide_session_path_marks_direct_ready() {
+        let policy = TraversalPolicy::default();
+        let initiator = SessionReport {
+            nat_type: NatType::RestrictedCone,
+            attempt: 2,
+            candidate_count: 3,
+            direct_ready: true,
+        };
+        let responder = SessionReport {
+            nat_type: NatType::RestrictedCone,
+            attempt: 2,
+            candidate_count: 2,
+            direct_ready: true,
+        };
+
+        let decision = decide_session_path(&policy, &initiator, &responder);
+        assert!(decision.is_ok());
+        let decision = if let Ok(value) = decision {
+            value
+        } else {
+            return;
+        };
+
+        assert_eq!(decision.path, ConnectivityPath::Direct);
+        assert_eq!(decision.reason, DecisionReason::DirectReady);
     }
 }
