@@ -94,6 +94,28 @@ curl http://127.0.0.1:8080/healthz
 cargo run -p kakachi-agent --bin agentd
 ```
 
+### Run One-Shot Session Negotiation
+
+Set these variables to execute a single live STUN + session report run:
+
+- KAKACHI_AGENT_NEGOTIATE_NETWORK_ID: target network UUID
+- KAKACHI_AGENT_NEGOTIATE_PEER: peer username
+- KAKACHI_AGENT_AUTH_TOKEN: JWT from /v1/auth/login
+- KAKACHI_AGENT_STUN_SERVERS: comma-separated STUN IP:port list (example: 74.125.250.129:19302)
+- KAKACHI_AGENT_NEGOTIATE_SESSION_ID: optional existing session UUID to report into
+
+Example:
+
+```bash
+export KAKACHI_CONTROL_PLANE_URL="http://127.0.0.1:8080"
+export KAKACHI_AGENT_BIND="0.0.0.0:7000"
+export KAKACHI_AGENT_NEGOTIATE_NETWORK_ID="<network-id>"
+export KAKACHI_AGENT_NEGOTIATE_PEER="bob"
+export KAKACHI_AGENT_AUTH_TOKEN="<jwt-token>"
+export KAKACHI_AGENT_STUN_SERVERS="74.125.250.129:19302"
+cargo run -p kakachi-agent --bin agentd
+```
+
 ## Implemented API Endpoints (Phase 1)
 
 - POST /v1/auth/register
@@ -109,19 +131,54 @@ cargo run -p kakachi-agent --bin agentd
 - POST /v1/networks/{network_id}/sessions/{session_id}/report
 - GET /v1/ws?token=<jwt>&network_id=<uuid>
 
+## Quick Local Self-Test (Two Peer Accounts)
+
+1. Start the control plane:
+
+```bash
+export KAKACHI_JWT_SECRET="replace-with-a-long-random-secret-at-least-32-characters"
+cargo run -p kakachi-api
+```
+
+2. Register two users (alice and bob) with WireGuard public keys:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8080/v1/auth/register -H 'content-type: application/json' -d '{"username":"alice","password":"very-strong-password-123","public_key":"<alice-public-key>"}'
+curl -sS -X POST http://127.0.0.1:8080/v1/auth/register -H 'content-type: application/json' -d '{"username":"bob","password":"very-strong-password-456","public_key":"<bob-public-key>"}'
+```
+
+3. Login both users and capture each `access_token` from response JSON.
+
+4. Create a network as alice, then join it as bob:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8080/v1/networks -H "authorization: Bearer <alice-token>" -H 'content-type: application/json' -d '{"name":"friends-net"}'
+curl -sS -X POST http://127.0.0.1:8080/v1/networks/<network-id>/join -H "authorization: Bearer <bob-token>"
+```
+
+5. Run alice one-shot negotiation and copy the emitted `session_id` from agent logs.
+
+6. Run bob one-shot negotiation with the same network and set `KAKACHI_AGENT_NEGOTIATE_SESSION_ID=<alice-session-id>` so both peers report into one session.
+
+7. Fetch final session state:
+
+```bash
+curl -sS http://127.0.0.1:8080/v1/networks/<network-id>/sessions/<session-id> -H "authorization: Bearer <alice-token>"
+```
+
 ## Current Risks And Gaps
 
 - API currently runs over HTTP locally; TLS termination and cert management still required for deployment.
 - Coordination persistence currently uses a single-node SQLite file without schema migrations yet.
 - Session negotiation state now decides direct-vs-relay deterministically, but live UDP hole-punch execution is not wired yet.
-- Core networking now includes STUN probe planning and NAT-based session report synthesis, but no live STUN transactions yet.
+- Agent one-shot negotiation now performs live STUN transactions and reports NAT observations, but direct UDP punch packets are not exchanged yet.
 - Relay packet forwarding is still pending; current relay requirement is signaling only.
 - Desktop UI is not started yet (planned for Tauri + React in Phase 3).
 
 ## Next Slice
 
 - Add migration/versioning flow for coordination schema and backup/restore tooling.
-- Integrate STUN queries and real UDP hole-punch workflow in core/net and agent daemon.
+- Integrate direct UDP hole-punch packet exchange and connect-time health checks.
 - Implement deterministic relay path for VPN packets and chat payload transport.
 
 ## Project Governance

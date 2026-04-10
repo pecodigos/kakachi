@@ -1,8 +1,11 @@
 use std::path::PathBuf;
+use std::str::FromStr;
 
-use kakachi_agent::{AgentConfig, AgentService};
+use anyhow::Context;
+use kakachi_agent::{AgentConfig, AgentService, ControlPlaneClient};
 use kakachi_net::TraversalPolicy;
 use tracing::info;
+use uuid::Uuid;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -33,6 +36,40 @@ async fn main() -> anyhow::Result<()> {
         "kakachi agent daemon initialized"
     );
 
+    if let Some(run) = load_negotiation_run_config()? {
+        info!(
+            network_id = %run.network_id,
+            peer = %run.peer_username,
+            session_id = ?run.session_id,
+            stun_servers = ?run.stun_servers,
+            "running one-shot session negotiation"
+        );
+
+        let control_plane =
+            ControlPlaneClient::new(&service.config().control_plane_url, run.access_token)?;
+
+        let summary = service
+            .run_session_negotiation(
+                &control_plane,
+                run.network_id,
+                &run.peer_username,
+                run.session_id,
+                &run.stun_servers,
+            )
+            .await?;
+
+        info!(
+            session_id = %summary.session_id,
+            state = ?summary.final_state,
+            path = ?summary.final_path,
+            reason = ?summary.final_reason,
+            attempts = summary.attempts_sent,
+            "session negotiation completed"
+        );
+
+        return Ok(());
+    }
+
     tokio::signal::ctrl_c().await?;
     info!("shutdown signal received");
 
@@ -47,4 +84,68 @@ fn init_tracing() {
         .with_target(true)
         .compact()
         .init();
+}
+
+struct NegotiationRunConfig {
+    network_id: Uuid,
+    peer_username: String,
+    session_id: Option<Uuid>,
+    access_token: String,
+    stun_servers: Vec<String>,
+}
+
+fn load_negotiation_run_config() -> anyhow::Result<Option<NegotiationRunConfig>> {
+    let network_id_raw = match std::env::var("KAKACHI_AGENT_NEGOTIATE_NETWORK_ID") {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+
+    let network_id = Uuid::from_str(network_id_raw.trim())
+        .context("KAKACHI_AGENT_NEGOTIATE_NETWORK_ID must be a valid UUID")?;
+
+    let session_id = match std::env::var("KAKACHI_AGENT_NEGOTIATE_SESSION_ID") {
+        Ok(value) => Some(
+            Uuid::from_str(value.trim())
+                .context("KAKACHI_AGENT_NEGOTIATE_SESSION_ID must be a valid UUID")?,
+        ),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => return Err(error.into()),
+    };
+
+    let peer_username = std::env::var("KAKACHI_AGENT_NEGOTIATE_PEER")
+        .context("KAKACHI_AGENT_NEGOTIATE_PEER is required when negotiation mode is enabled")?
+        .trim()
+        .to_owned();
+    if peer_username.is_empty() {
+        anyhow::bail!("KAKACHI_AGENT_NEGOTIATE_PEER cannot be empty");
+    }
+
+    let access_token = std::env::var("KAKACHI_AGENT_AUTH_TOKEN")
+        .context("KAKACHI_AGENT_AUTH_TOKEN is required when negotiation mode is enabled")?
+        .trim()
+        .to_owned();
+    if access_token.is_empty() {
+        anyhow::bail!("KAKACHI_AGENT_AUTH_TOKEN cannot be empty");
+    }
+
+    let stun_servers_raw = std::env::var("KAKACHI_AGENT_STUN_SERVERS")
+        .context("KAKACHI_AGENT_STUN_SERVERS is required when negotiation mode is enabled")?;
+    let stun_servers = stun_servers_raw
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    if stun_servers.is_empty() {
+        anyhow::bail!("KAKACHI_AGENT_STUN_SERVERS must contain at least one ip:port entry");
+    }
+
+    Ok(Some(NegotiationRunConfig {
+        network_id,
+        peer_username,
+        session_id,
+        access_token,
+        stun_servers,
+    }))
 }
