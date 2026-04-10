@@ -1,4 +1,6 @@
 use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use argon2::password_hash::{PasswordHash, PasswordHasher, SaltString};
@@ -8,6 +10,7 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use chrono::{DateTime, Utc};
 use rand::rngs::OsRng;
 use regex::Regex;
+use rusqlite::{Connection, params};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -41,6 +44,8 @@ pub enum CoordinationError {
     InconsistentState,
     #[error("internal password hashing failure")]
     PasswordHashFailure,
+    #[error("storage failure: {0}")]
+    StorageFailure(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -111,14 +116,301 @@ struct NetworkRecord {
 }
 
 #[derive(Debug, Default)]
+struct LoadedState {
+    users: HashMap<String, UserRecord>,
+    networks: HashMap<Uuid, NetworkRecord>,
+}
+
+#[derive(Debug, Clone)]
+struct SqliteCoordinationStorage {
+    database_path: PathBuf,
+}
+
+impl SqliteCoordinationStorage {
+    fn open(database_path: &Path) -> Result<Self, CoordinationError> {
+        if let Some(parent) = database_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|err| CoordinationError::StorageFailure(err.to_string()))?;
+        }
+
+        let storage = Self {
+            database_path: database_path.to_path_buf(),
+        };
+        storage.init_schema()?;
+        Ok(storage)
+    }
+
+    fn init_schema(&self) -> Result<(), CoordinationError> {
+        self.with_connection(|conn| {
+            conn.execute_batch(
+                "
+                PRAGMA journal_mode=WAL;
+                PRAGMA foreign_keys=ON;
+
+                CREATE TABLE IF NOT EXISTS users (
+                    username_lookup TEXT PRIMARY KEY,
+                    username TEXT NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    public_key TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS networks (
+                    network_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    owner_username_lookup TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(owner_username_lookup) REFERENCES users(username_lookup)
+                );
+
+                CREATE TABLE IF NOT EXISTS network_members (
+                    network_id TEXT NOT NULL,
+                    username_lookup TEXT NOT NULL,
+                    PRIMARY KEY (network_id, username_lookup),
+                    FOREIGN KEY(network_id) REFERENCES networks(network_id) ON DELETE CASCADE,
+                    FOREIGN KEY(username_lookup) REFERENCES users(username_lookup) ON DELETE CASCADE
+                );
+                ",
+            )
+            .map_err(sqlite_err)?;
+            Ok(())
+        })
+    }
+
+    fn with_connection<T>(
+        &self,
+        operation: impl FnOnce(&mut Connection) -> Result<T, CoordinationError>,
+    ) -> Result<T, CoordinationError> {
+        let mut connection = Connection::open(&self.database_path).map_err(sqlite_err)?;
+        connection
+            .execute("PRAGMA foreign_keys=ON", [])
+            .map_err(sqlite_err)?;
+        operation(&mut connection)
+    }
+
+    fn load_snapshot(&self) -> Result<LoadedState, CoordinationError> {
+        self.with_connection(|conn| {
+            let mut users = HashMap::new();
+            let mut networks = HashMap::new();
+
+            let mut user_statement = conn
+                .prepare(
+                    "
+                    SELECT username_lookup, username, password_hash, public_key, created_at
+                    FROM users
+                    ",
+                )
+                .map_err(sqlite_err)?;
+
+            let user_rows = user_statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                })
+                .map_err(sqlite_err)?;
+
+            for row in user_rows {
+                let (username_lookup, username, password_hash, public_key_raw, created_at_raw) =
+                    row.map_err(sqlite_err)?;
+                let public_key = PublicKey::parse(&public_key_raw)?;
+                let created_at = parse_rfc3339_utc(&created_at_raw)?;
+
+                users.insert(
+                    username_lookup,
+                    UserRecord {
+                        username,
+                        password_hash,
+                        public_key,
+                        created_at,
+                    },
+                );
+            }
+
+            let mut network_statement = conn
+                .prepare(
+                    "
+                    SELECT network_id, name, owner_username_lookup, created_at
+                    FROM networks
+                    ",
+                )
+                .map_err(sqlite_err)?;
+
+            let network_rows = network_statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .map_err(sqlite_err)?;
+
+            for row in network_rows {
+                let (network_id_raw, name, owner_username_lookup, created_at_raw) =
+                    row.map_err(sqlite_err)?;
+                let network_id = Uuid::parse_str(&network_id_raw)
+                    .map_err(|_| CoordinationError::InconsistentState)?;
+                let created_at = parse_rfc3339_utc(&created_at_raw)?;
+
+                networks.insert(
+                    network_id,
+                    NetworkRecord {
+                        network_id,
+                        name,
+                        owner_username_lookup,
+                        member_usernames_lookup: HashSet::new(),
+                        created_at,
+                    },
+                );
+            }
+
+            let mut member_statement = conn
+                .prepare(
+                    "
+                    SELECT network_id, username_lookup
+                    FROM network_members
+                    ",
+                )
+                .map_err(sqlite_err)?;
+
+            let member_rows = member_statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(sqlite_err)?;
+
+            for row in member_rows {
+                let (network_id_raw, username_lookup) = row.map_err(sqlite_err)?;
+                let network_id = Uuid::parse_str(&network_id_raw)
+                    .map_err(|_| CoordinationError::InconsistentState)?;
+
+                let network = networks
+                    .get_mut(&network_id)
+                    .ok_or(CoordinationError::InconsistentState)?;
+                network.member_usernames_lookup.insert(username_lookup);
+            }
+
+            Ok(LoadedState { users, networks })
+        })
+    }
+
+    fn insert_user(
+        &self,
+        username_lookup: &str,
+        record: &UserRecord,
+    ) -> Result<(), CoordinationError> {
+        self.with_connection(|conn| {
+            conn.execute(
+                "
+                INSERT INTO users (
+                    username_lookup, username, password_hash, public_key, created_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5)
+                ",
+                params![
+                    username_lookup,
+                    record.username,
+                    record.password_hash,
+                    record.public_key.as_str(),
+                    record.created_at.to_rfc3339(),
+                ],
+            )
+            .map_err(sqlite_err)?;
+            Ok(())
+        })
+    }
+
+    fn insert_network(&self, record: &NetworkRecord) -> Result<(), CoordinationError> {
+        self.with_connection(|conn| {
+            let transaction = conn.transaction().map_err(sqlite_err)?;
+            transaction
+                .execute(
+                    "
+                    INSERT INTO networks (
+                        network_id, name, owner_username_lookup, created_at
+                    ) VALUES (?1, ?2, ?3, ?4)
+                    ",
+                    params![
+                        record.network_id.to_string(),
+                        record.name,
+                        record.owner_username_lookup,
+                        record.created_at.to_rfc3339(),
+                    ],
+                )
+                .map_err(sqlite_err)?;
+
+            for member_lookup in &record.member_usernames_lookup {
+                transaction
+                    .execute(
+                        "
+                        INSERT INTO network_members (
+                            network_id, username_lookup
+                        ) VALUES (?1, ?2)
+                        ",
+                        params![record.network_id.to_string(), member_lookup],
+                    )
+                    .map_err(sqlite_err)?;
+            }
+
+            transaction.commit().map_err(sqlite_err)?;
+            Ok(())
+        })
+    }
+
+    fn insert_network_member(
+        &self,
+        network_id: Uuid,
+        username_lookup: &str,
+    ) -> Result<(), CoordinationError> {
+        self.with_connection(|conn| {
+            conn.execute(
+                "
+                INSERT OR IGNORE INTO network_members (
+                    network_id, username_lookup
+                ) VALUES (?1, ?2)
+                ",
+                params![network_id.to_string(), username_lookup],
+            )
+            .map_err(sqlite_err)?;
+            Ok(())
+        })
+    }
+}
+
+#[derive(Debug, Default)]
 pub struct ControlPlaneState {
     users: RwLock<HashMap<String, UserRecord>>,
     networks: RwLock<HashMap<Uuid, NetworkRecord>>,
+    storage: Option<SqliteCoordinationStorage>,
 }
 
 impl ControlPlaneState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn new_with_sqlite(database_path: impl AsRef<Path>) -> Result<Self, CoordinationError> {
+        let storage = SqliteCoordinationStorage::open(database_path.as_ref())?;
+        let snapshot = storage.load_snapshot()?;
+
+        Ok(Self {
+            users: RwLock::new(snapshot.users),
+            networks: RwLock::new(snapshot.networks),
+            storage: Some(storage),
+        })
+    }
+
+    pub fn persistence_backend(&self) -> &'static str {
+        if self.storage.is_some() {
+            "sqlite"
+        } else {
+            "memory"
+        }
     }
 
     pub async fn register_user(
@@ -144,6 +436,10 @@ impl ControlPlaneState {
             public_key: parsed_public_key.clone(),
             created_at,
         };
+
+        if let Some(storage) = &self.storage {
+            storage.insert_user(&username_lookup, &record)?;
+        }
 
         users.insert(username_lookup, record.clone());
 
@@ -201,6 +497,9 @@ impl ControlPlaneState {
         record.member_usernames_lookup.insert(owner_lookup);
 
         let mut networks = self.networks.write().await;
+        if let Some(storage) = &self.storage {
+            storage.insert_network(&record)?;
+        }
         networks.insert(network_id, record);
         drop(networks);
 
@@ -225,9 +524,15 @@ impl ControlPlaneState {
         let network = networks
             .get_mut(&network_id)
             .ok_or(CoordinationError::NetworkNotFound)?;
-        network.member_usernames_lookup.insert(username_lookup);
-        drop(networks);
 
+        if !network.member_usernames_lookup.contains(&username_lookup) {
+            if let Some(storage) = &self.storage {
+                storage.insert_network_member(network_id, &username_lookup)?;
+            }
+            network.member_usernames_lookup.insert(username_lookup);
+        }
+
+        drop(networks);
         self.get_network_summary(network_id).await
     }
 
@@ -368,12 +673,28 @@ fn verify_password(password_hash: &str, password: &SecretString) -> Result<(), C
         .map_err(|_| CoordinationError::InvalidCredentials)
 }
 
+fn parse_rfc3339_utc(raw: &str) -> Result<DateTime<Utc>, CoordinationError> {
+    DateTime::parse_from_rfc3339(raw)
+        .map(|value| value.with_timezone(&Utc))
+        .map_err(|_| CoordinationError::InconsistentState)
+}
+
+fn sqlite_err(err: rusqlite::Error) -> CoordinationError {
+    CoordinationError::StorageFailure(err.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn fixture_public_key(seed: u8) -> String {
         BASE64_STANDARD.encode([seed; 32])
+    }
+
+    fn cleanup_sqlite_files(database_path: &Path) {
+        let _ = std::fs::remove_file(database_path);
+        let _ = std::fs::remove_file(format!("{}-wal", database_path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", database_path.display()));
     }
 
     #[test]
@@ -433,5 +754,67 @@ mod tests {
             0
         };
         assert_eq!(peer_count, 2);
+    }
+
+    #[tokio::test]
+    async fn sqlite_storage_survives_restart() {
+        let database_path =
+            std::env::temp_dir().join(format!("kakachi-coordination-{}.db", Uuid::new_v4()));
+        cleanup_sqlite_files(&database_path);
+
+        let created_network_id = {
+            let state_result = ControlPlaneState::new_with_sqlite(&database_path);
+            assert!(state_result.is_ok());
+            let state = if let Ok(value) = state_result {
+                value
+            } else {
+                return;
+            };
+
+            let alice_password = SecretString::new("ValidPassword123".to_owned());
+            let bob_password = SecretString::new("DifferentPass123".to_owned());
+
+            let register_alice = state
+                .register_user("alice", &alice_password, &fixture_public_key(5))
+                .await;
+            let register_bob = state
+                .register_user("bob", &bob_password, &fixture_public_key(6))
+                .await;
+            assert!(register_alice.is_ok());
+            assert!(register_bob.is_ok());
+
+            let network = state.create_network("alice", "persisted").await;
+            assert!(network.is_ok());
+            let network_id = if let Ok(summary) = network {
+                summary.network_id
+            } else {
+                Uuid::nil()
+            };
+
+            assert_ne!(network_id, Uuid::nil());
+            let join = state.join_network(network_id, "bob").await;
+            assert!(join.is_ok());
+            network_id
+        };
+
+        let reloaded_result = ControlPlaneState::new_with_sqlite(&database_path);
+        assert!(reloaded_result.is_ok());
+        let reloaded = if let Ok(value) = reloaded_result {
+            value
+        } else {
+            cleanup_sqlite_files(&database_path);
+            return;
+        };
+
+        let peers = reloaded.list_peers(created_network_id, "alice").await;
+        assert!(peers.is_ok());
+        let peer_count = if let Ok(items) = peers {
+            items.len()
+        } else {
+            0
+        };
+        assert_eq!(peer_count, 2);
+
+        cleanup_sqlite_files(&database_path);
     }
 }

@@ -56,6 +56,7 @@ Control plane server:
 
 - KAKACHI_JWT_SECRET: required, at least 32 chars
 - KAKACHI_API_BIND: optional, default 127.0.0.1:8080
+- KAKACHI_COORDINATION_DB: optional, default ./.kakachi/control-plane.db
 
 Agent daemon:
 
@@ -106,13 +107,13 @@ cargo run -p kakachi-agent --bin agentd
 ## Current Risks And Gaps
 
 - API currently runs over HTTP locally; TLS termination and cert management still required for deployment.
-- Coordination state is in-memory and not yet persistent.
+- Coordination persistence currently uses a single-node SQLite file without schema migrations yet.
 - NAT traversal and relay transport are modeled but not fully wired into live packet flow.
 - Desktop UI is not started yet (planned for Tauri + React in Phase 3).
 
 ## Next Slice
 
-- Add persistent server-side storage (accounts, networks, membership).
+- Add migration/versioning flow for coordination schema and backup/restore tooling.
 - Introduce DTLS/QUIC or UDP session manager for direct peer session establishment.
 - Implement deterministic relay path for VPN packets and chat payload transport.
 

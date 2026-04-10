@@ -685,6 +685,7 @@ dependencies = [
  "chrono",
  "rand 0.8.5",
  "regex",
+ "rusqlite",
  "secrecy",
  "serde",
  "thiserror",

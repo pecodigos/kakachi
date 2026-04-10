@@ -240,9 +240,9 @@ fn map_coordination_error(err: CoordinationError) -> ApiError {
         CoordinationError::UserNotFound | CoordinationError::NetworkNotFound => {
             ApiError::not_found(err.to_string())
         }
-        CoordinationError::InconsistentState | CoordinationError::PasswordHashFailure => {
-            ApiError::internal("internal coordination error")
-        }
+        CoordinationError::InconsistentState
+        | CoordinationError::PasswordHashFailure
+        | CoordinationError::StorageFailure(_) => ApiError::internal("internal coordination error"),
     }
 }
 
@@ -536,10 +536,21 @@ fn build_app_state() -> anyhow::Result<AppState> {
     let jwt_secret = std::env::var("KAKACHI_JWT_SECRET")
         .context("KAKACHI_JWT_SECRET must be set for API startup")?;
 
+    let coordination_db = std::env::var("KAKACHI_COORDINATION_DB")
+        .unwrap_or_else(|_| "./.kakachi/control-plane.db".to_owned());
+
     let auth = AuthService::new(&jwt_secret).map_err(|err| anyhow::anyhow!(err.message))?;
+    let control = ControlPlaneState::new_with_sqlite(&coordination_db)
+        .with_context(|| format!("failed to initialize coordination DB at {coordination_db}"))?;
+
+    info!(
+        database_path = %coordination_db,
+        backend = %control.persistence_backend(),
+        "coordination state initialized"
+    );
 
     Ok(AppState {
-        control: Arc::new(ControlPlaneState::new()),
+        control: Arc::new(control),
         auth: Arc::new(auth),
     })
 }
