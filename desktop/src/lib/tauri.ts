@@ -124,6 +124,7 @@ export function generateWireguardIdentity(): Promise<GeneratedKeyPair> {
 export function registerUser(input: {
   control_plane_url: string;
   username: string;
+  email?: string;
   password: string;
   public_key: string;
 }): Promise<RegisterResponse> {

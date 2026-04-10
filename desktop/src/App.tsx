@@ -1,53 +1,123 @@
-import { FormEvent, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useState } from "react";
 import {
   createNetwork,
   generateWireguardIdentity,
-  getSession,
   joinNetwork,
   listPeers,
   loginUser,
-  openSession,
-  pingControlPlane,
   registerUser,
   runSessionProbe,
   type NegotiationRunSummary,
   type NetworkSummary,
-  type PeerIdentity,
-  type SessionSummary
+  type PeerIdentity
 } from "./lib/tauri";
 
+type AuthView = "login" | "register";
+
+interface SavedLogin {
+  controlPlaneUrl: string;
+  username: string;
+  accessToken: string;
+  expiresAt: string;
+}
+
+const SAVED_LOGIN_KEY = "kakachi.saved-login.v1";
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+function readSavedLogin(): SavedLogin | null {
+  if (typeof window === "undefined") {
+    return null;
+  }
+
+  const raw = window.localStorage.getItem(SAVED_LOGIN_KEY);
+  if (!raw) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(raw) as Partial<SavedLogin>;
+    if (
+      typeof parsed.controlPlaneUrl === "string" &&
+      typeof parsed.username === "string" &&
+      typeof parsed.accessToken === "string" &&
+      typeof parsed.expiresAt === "string"
+    ) {
+      return {
+        controlPlaneUrl: parsed.controlPlaneUrl,
+        username: parsed.username,
+        accessToken: parsed.accessToken,
+        expiresAt: parsed.expiresAt
+      };
+    }
+  } catch {
+    window.localStorage.removeItem(SAVED_LOGIN_KEY);
+  }
+
+  return null;
+}
+
+function writeSavedLogin(payload: SavedLogin) {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  window.localStorage.setItem(SAVED_LOGIN_KEY, JSON.stringify(payload));
+}
+
+function clearSavedLogin() {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  window.localStorage.removeItem(SAVED_LOGIN_KEY);
+}
+
 export default function App() {
+  const [authView, setAuthView] = useState<AuthView>("login");
   const [controlPlaneUrl, setControlPlaneUrl] = useState("http://127.0.0.1:8080");
-  const [apiStatus, setApiStatus] = useState("Not checked");
+  const [statusMessage, setStatusMessage] = useState("Sign in to start your virtual LAN.");
 
-  const [registerUsername, setRegisterUsername] = useState("alice");
-  const [registerPassword, setRegisterPassword] = useState("very-strong-password-123");
-  const [publicKey, setPublicKey] = useState("");
-  const [privateKey, setPrivateKey] = useState("");
+  const [registerUsername, setRegisterUsername] = useState("");
+  const [registerEmail, setRegisterEmail] = useState("");
+  const [registerPassword, setRegisterPassword] = useState("");
+  const [registerConfirmPassword, setRegisterConfirmPassword] = useState("");
 
-  const [loginUsername, setLoginUsername] = useState("alice");
-  const [loginPassword, setLoginPassword] = useState("very-strong-password-123");
+  const [loginUsername, setLoginUsername] = useState("");
+  const [loginPassword, setLoginPassword] = useState("");
+  const [saveLogin, setSaveLogin] = useState(true);
+  const [savedLogin, setSavedLogin] = useState<SavedLogin | null>(null);
+  const [currentUsername, setCurrentUsername] = useState("");
   const [accessToken, setAccessToken] = useState("");
   const [tokenExpiresAt, setTokenExpiresAt] = useState("");
 
-  const [networkName, setNetworkName] = useState("friends-net");
+  const [networkName, setNetworkName] = useState("friends-network");
   const [networkId, setNetworkId] = useState("");
   const [joinNetworkId, setJoinNetworkId] = useState("");
   const [peers, setPeers] = useState<PeerIdentity[]>([]);
   const [activeNetwork, setActiveNetwork] = useState<NetworkSummary | null>(null);
 
-  const [peerUsername, setPeerUsername] = useState("bob");
+  const [peerUsername, setPeerUsername] = useState("");
+  const [connectIntent, setConnectIntent] = useState<"lan" | "vpn">("lan");
   const [stunServersCsv, setStunServersCsv] = useState("74.125.250.129:19302");
   const [localBindAddr, setLocalBindAddr] = useState("0.0.0.0:7001");
-  const [sessionId, setSessionId] = useState("");
-  const [sessionSummary, setSessionSummary] = useState<SessionSummary | null>(null);
   const [runSummary, setRunSummary] = useState<NegotiationRunSummary | null>(null);
 
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [eventLog, setEventLog] = useState<string[]>([]);
 
-  const canUseAuthedActions = accessToken.trim().length > 0;
+  const canUseAuthedActions = accessToken.trim().length > 0 && currentUsername.trim().length > 0;
+
+  useEffect(() => {
+    const saved = readSavedLogin();
+    if (!saved) {
+      return;
+    }
+
+    setSavedLogin(saved);
+    setControlPlaneUrl(saved.controlPlaneUrl);
+    setLoginUsername(saved.username);
+    setStatusMessage(`Saved login found for ${saved.username}.`);
+  }, []);
 
   const parsedStunServers = useMemo(
     () =>
@@ -58,8 +128,28 @@ export default function App() {
     [stunServersCsv]
   );
 
-  function appendLog(entry: string) {
-    setEventLog((current) => [`${new Date().toISOString()} ${entry}`, ...current].slice(0, 18));
+  const visiblePeers = useMemo(
+    () => peers.filter((peer) => peer.username !== currentUsername),
+    [peers, currentUsername]
+  );
+
+  const connectionLabel = useMemo(() => {
+    if (!runSummary) {
+      return "Not connected yet";
+    }
+
+    return runSummary.final_path === "direct" ? "Direct LAN tunnel ready" : "Connected through relay";
+  }, [runSummary]);
+
+  const connectIntentLabel = connectIntent === "lan" ? "LAN party mode" : "Remote VPN mode";
+
+  function resetNetworkState() {
+    setNetworkId("");
+    setJoinNetworkId("");
+    setPeers([]);
+    setPeerUsername("");
+    setRunSummary(null);
+    setActiveNetwork(null);
   }
 
   async function runAction<T>(label: string, operation: () => Promise<T>, onSuccess: (value: T) => void) {
@@ -69,11 +159,10 @@ export default function App() {
     try {
       const value = await operation();
       onSuccess(value);
-      appendLog(`${label}: success`);
     } catch (err) {
       const message = err instanceof Error ? err.message : "Unexpected error";
       setError(message);
-      appendLog(`${label}: failed (${message})`);
+      setStatusMessage(`${label} failed.`);
     } finally {
       setBusy(null);
     }
@@ -87,56 +176,164 @@ export default function App() {
     return true;
   }
 
-  async function onCheckHealth() {
-    await runAction("Health check", () => pingControlPlane(controlPlaneUrl), (response) => {
-      setApiStatus(`${response.status} at ${response.timestamp}`);
-    });
-  }
-
-  async function onGenerateKeys() {
-    await runAction("Generate WireGuard identity", () => generateWireguardIdentity(), (identity) => {
-      setPublicKey(identity.public_key);
-      setPrivateKey(identity.private_key);
-    });
-  }
-
   async function onRegister(event: FormEvent) {
     event.preventDefault();
+
+    const username = registerUsername.trim();
+    const email = registerEmail.trim();
+
+    if (!username) {
+      setError("Username is required.");
+      return;
+    }
+
+    if (!EMAIL_PATTERN.test(email)) {
+      setError("Enter a valid email address.");
+      return;
+    }
+
+    if (registerPassword.length < 12) {
+      setError("Password must have at least 12 characters.");
+      return;
+    }
+
+    if (registerPassword !== registerConfirmPassword) {
+      setError("Password and confirm password must match.");
+      return;
+    }
+
     await runAction(
-      "Register user",
-      () =>
-        registerUser({
+      "Create account",
+      async () => {
+        const identity = await generateWireguardIdentity();
+
+        return registerUser({
           control_plane_url: controlPlaneUrl,
-          username: registerUsername,
+          username,
+          email,
           password: registerPassword,
-          public_key: publicKey
-        }),
+          public_key: identity.public_key
+        });
+      },
       (response) => {
+        setAuthView("login");
         setLoginUsername(response.username);
+        setRegisterUsername("");
+        setRegisterEmail("");
+        setRegisterPassword("");
+        setRegisterConfirmPassword("");
+        setStatusMessage("Account created. Sign in to continue.");
       }
     );
   }
 
   async function onLogin(event: FormEvent) {
     event.preventDefault();
+
+    const username = loginUsername.trim();
+    if (!username || !loginPassword) {
+      setError("Username and password are required.");
+      return;
+    }
+
     await runAction(
-      "Login user",
+      "Sign in",
       () =>
         loginUser({
           control_plane_url: controlPlaneUrl,
-          username: loginUsername,
+          username,
           password: loginPassword
         }),
       (response) => {
         setAccessToken(response.access_token);
         setTokenExpiresAt(response.expires_at);
+        setCurrentUsername(username);
+        setLoginPassword("");
+        setStatusMessage(`Welcome, ${username}.`);
+
+        if (saveLogin) {
+          const payload = {
+            controlPlaneUrl,
+            username,
+            accessToken: response.access_token,
+            expiresAt: response.expires_at
+          };
+
+          setSavedLogin(payload);
+          writeSavedLogin({
+            controlPlaneUrl,
+            username,
+            accessToken: response.access_token,
+            expiresAt: response.expires_at
+          });
+        } else {
+          clearSavedLogin();
+          setSavedLogin(null);
+        }
       }
     );
+  }
+
+  function onUseSavedLogin() {
+    if (!savedLogin) {
+      return;
+    }
+
+    const expiresAtMs = Date.parse(savedLogin.expiresAt);
+    if (Number.isFinite(expiresAtMs) && expiresAtMs < Date.now()) {
+      clearSavedLogin();
+      setSavedLogin(null);
+      setError("Saved login expired. Sign in with password again.");
+      return;
+    }
+
+    setCurrentUsername(savedLogin.username);
+    setAccessToken(savedLogin.accessToken);
+    setTokenExpiresAt(savedLogin.expiresAt);
+    setControlPlaneUrl(savedLogin.controlPlaneUrl);
+    setError(null);
+    setStatusMessage(`Welcome back, ${savedLogin.username}.`);
+  }
+
+  function onLogout() {
+    setAccessToken("");
+    setTokenExpiresAt("");
+    setCurrentUsername("");
+    setLoginPassword("");
+    setError(null);
+    setStatusMessage("Signed out.");
+    resetNetworkState();
+    clearSavedLogin();
+    setSavedLogin(null);
+  }
+
+  async function onCopyNetworkId() {
+    if (!networkId) {
+      return;
+    }
+
+    try {
+      await navigator.clipboard.writeText(networkId);
+      setStatusMessage("Network ID copied. Share it with your friend.");
+    } catch {
+      setError("Could not copy network ID. Copy it manually.");
+    }
+  }
+
+  function onChangeNetwork() {
+    resetNetworkState();
+    setStatusMessage("Choose or create a network.");
   }
 
   async function onCreateNetwork(event: FormEvent) {
     event.preventDefault();
     if (!requireAuth()) return;
+
+    const trimmedName = networkName.trim();
+    if (!trimmedName) {
+      setError("Network name is required.");
+      return;
+    }
 
     await runAction(
       "Create network",
@@ -144,12 +341,13 @@ export default function App() {
         createNetwork({
           control_plane_url: controlPlaneUrl,
           access_token: accessToken,
-          name: networkName
+          name: trimmedName
         }),
       (response) => {
         setActiveNetwork(response);
         setNetworkId(response.network_id);
         setJoinNetworkId(response.network_id);
+        setStatusMessage(`Network ${response.name} is ready.`);
       }
     );
   }
@@ -158,30 +356,37 @@ export default function App() {
     event.preventDefault();
     if (!requireAuth()) return;
 
+    const trimmedNetworkId = joinNetworkId.trim();
+    if (!trimmedNetworkId) {
+      setError("Network ID is required.");
+      return;
+    }
+
     await runAction(
       "Join network",
       () =>
         joinNetwork({
           control_plane_url: controlPlaneUrl,
           access_token: accessToken,
-          network_id: joinNetworkId
+          network_id: trimmedNetworkId
         }),
       (response) => {
         setActiveNetwork(response);
         setNetworkId(response.network_id);
+        setStatusMessage(`Joined network ${response.name}.`);
       }
     );
   }
 
-  async function onListPeers() {
+  async function onRefreshPeers() {
     if (!requireAuth()) return;
     if (!networkId) {
-      setError("Set network id first.");
+      setError("Create or join a network first.");
       return;
     }
 
     await runAction(
-      "List peers",
+      "Refresh peers",
       () =>
         listPeers({
           control_plane_url: controlPlaneUrl,
@@ -190,257 +395,292 @@ export default function App() {
         }),
       (response) => {
         setPeers(response);
+        if (response.length === 0) {
+          setStatusMessage("No peers in this network yet.");
+        } else {
+          setStatusMessage(`Found ${response.length} peer(s) in your network.`);
+        }
       }
     );
   }
 
-  async function onOpenSession() {
+  async function onConnectPeer() {
     if (!requireAuth()) return;
     if (!networkId) {
-      setError("Set network id first.");
+      setError("Create or join a network first.");
       return;
     }
 
-    await runAction(
-      "Open session",
-      () =>
-        openSession({
-          control_plane_url: controlPlaneUrl,
-          access_token: accessToken,
-          network_id: networkId,
-          peer_username: peerUsername
-        }),
-      (response) => {
-        setSessionSummary(response);
-        setSessionId(response.session_id);
-      }
-    );
-  }
-
-  async function onRunNegotiation() {
-    if (!requireAuth()) return;
-    if (!networkId) {
-      setError("Set network id first.");
+    const trimmedPeer = peerUsername.trim();
+    if (!trimmedPeer) {
+      setError("Peer username is required.");
       return;
     }
+
     if (parsedStunServers.length === 0) {
-      setError("Add at least one STUN server.");
+      setError("Add at least one STUN server in advanced settings.");
       return;
     }
 
     await runAction(
-      "Run session negotiation",
+      "Connect",
       () =>
         runSessionProbe({
           control_plane_url: controlPlaneUrl,
           access_token: accessToken,
           network_id: networkId,
-          peer_username: peerUsername,
+          peer_username: trimmedPeer,
           stun_servers: parsedStunServers,
           local_bind_addr: localBindAddr,
-          session_id: sessionId || undefined
+          session_id: runSummary?.session_id
         }),
       (response) => {
         setRunSummary(response);
-        setSessionId(response.session_id);
+        const pathLabel = response.final_path === "direct" ? "direct LAN tunnel" : "relay tunnel";
+        const usage = connectIntent === "lan" ? "LAN apps" : "VPN traffic";
+        setStatusMessage(`Connected to ${trimmedPeer} for ${usage} using ${pathLabel}.`);
       }
     );
   }
 
-  async function onFetchSession() {
-    if (!requireAuth()) return;
-    if (!networkId || !sessionId) {
-      setError("Set network id and session id first.");
-      return;
-    }
+  if (!canUseAuthedActions) {
+    return (
+      <div className="page">
+        <div className="backdrop" />
+        <main className="auth-shell">
+          <section className="panel auth-panel">
+            <p className="badge">KAKACHI</p>
+            <h1>Virtual LAN for real people</h1>
+            <p className="supporting-copy">Sign in, pick a network, and connect like you are on the same router.</p>
 
-    await runAction(
-      "Fetch session",
-      () =>
-        getSession({
-          control_plane_url: controlPlaneUrl,
-          access_token: accessToken,
-          network_id: networkId,
-          session_id: sessionId
-        }),
-      (response) => {
-        setSessionSummary(response);
-      }
+            <label>
+              Server address
+              <input
+                value={controlPlaneUrl}
+                onChange={(event) => setControlPlaneUrl(event.target.value)}
+                placeholder="http://127.0.0.1:8080"
+              />
+            </label>
+
+            {authView === "login" ? (
+              <form onSubmit={onLogin} className="form-stack">
+                <label>
+                  Username
+                  <input value={loginUsername} onChange={(event) => setLoginUsername(event.target.value)} />
+                </label>
+                <label>
+                  Password
+                  <input
+                    type="password"
+                    value={loginPassword}
+                    onChange={(event) => setLoginPassword(event.target.value)}
+                  />
+                </label>
+                <label className="checkbox-row">
+                  <input
+                    type="checkbox"
+                    checked={saveLogin}
+                    onChange={(event) => setSaveLogin(event.target.checked)}
+                  />
+                  Save login on this device
+                </label>
+                <button disabled={!!busy} type="submit">
+                  {busy === "Sign in" ? "Signing in..." : "Sign in"}
+                </button>
+                {savedLogin ? (
+                  <button className="secondary" type="button" onClick={onUseSavedLogin} disabled={!!busy}>
+                    Continue as {savedLogin.username}
+                  </button>
+                ) : null}
+              </form>
+            ) : (
+              <form onSubmit={onRegister} className="form-stack">
+                <label>
+                  Username
+                  <input
+                    value={registerUsername}
+                    onChange={(event) => setRegisterUsername(event.target.value)}
+                  />
+                </label>
+                <label>
+                  Email
+                  <input value={registerEmail} onChange={(event) => setRegisterEmail(event.target.value)} />
+                </label>
+                <label>
+                  Password
+                  <input
+                    type="password"
+                    value={registerPassword}
+                    onChange={(event) => setRegisterPassword(event.target.value)}
+                  />
+                </label>
+                <label>
+                  Confirm password
+                  <input
+                    type="password"
+                    value={registerConfirmPassword}
+                    onChange={(event) => setRegisterConfirmPassword(event.target.value)}
+                  />
+                </label>
+                <button disabled={!!busy} type="submit">
+                  {busy === "Create account" ? "Creating account..." : "Create account"}
+                </button>
+              </form>
+            )}
+
+            <button
+              className="link-button"
+              disabled={!!busy}
+              onClick={() => {
+                setAuthView((current) => (current === "login" ? "register" : "login"));
+                setError(null);
+              }}
+            >
+              {authView === "login" ? "Create account" : "Back to sign in"}
+            </button>
+
+            {error ? <p className="banner error">{error}</p> : null}
+            <p className="banner status">{statusMessage}</p>
+          </section>
+        </main>
+      </div>
     );
   }
 
   return (
     <div className="page">
-      <div className="blur-shape shape-a" />
-      <div className="blur-shape shape-b" />
-      <div className="blur-shape shape-c" />
-
-      <main className="shell">
-        <header className="hero card">
-          <p className="eyebrow">Kakachi Desktop</p>
-          <h1>Control Plane + Agent In One Desktop Surface</h1>
-          <p>
-            Register users, create networks, open sessions, and run live STUN-backed session reports
-            directly from the app.
-          </p>
+      <div className="backdrop" />
+      <main className="app-shell">
+        <header className="topbar panel">
+          <div>
+            <p className="badge">KAKACHI</p>
+            <h1>Your Private LAN</h1>
+            <p className="supporting-copy">Signed in as {currentUsername}</p>
+          </div>
+          <button className="secondary" onClick={onLogout}>
+            Log out
+          </button>
         </header>
 
-        <section className="card grid-row">
-          <label>
-            Control Plane URL
-            <input
-              value={controlPlaneUrl}
-              onChange={(event) => setControlPlaneUrl(event.target.value)}
-              placeholder="http://127.0.0.1:8080"
-            />
-          </label>
-          <button disabled={!!busy} onClick={onCheckHealth}>
-            {busy === "Health check" ? "Checking..." : "Check API Health"}
-          </button>
-          <p className="inline-note">Status: {apiStatus}</p>
-        </section>
-
-        <section className="cluster">
-          <article className="card">
-            <h2>Identity</h2>
-            <button disabled={!!busy} onClick={onGenerateKeys}>
-              {busy === "Generate WireGuard identity" ? "Generating..." : "Generate WireGuard Keypair"}
-            </button>
-            <label>
-              Public Key
-              <textarea value={publicKey} onChange={(event) => setPublicKey(event.target.value)} rows={3} />
-            </label>
-            <label>
-              Private Key
-              <textarea value={privateKey} readOnly rows={3} />
-            </label>
-
-            <form onSubmit={onRegister}>
-              <label>
-                Username
-                <input
-                  value={registerUsername}
-                  onChange={(event) => setRegisterUsername(event.target.value)}
-                />
-              </label>
-              <label>
-                Password
-                <input
-                  type="password"
-                  value={registerPassword}
-                  onChange={(event) => setRegisterPassword(event.target.value)}
-                />
-              </label>
-              <button disabled={!!busy || !publicKey.trim()} type="submit">
-                {busy === "Register user" ? "Registering..." : "Register User"}
-              </button>
-            </form>
-
-            <form onSubmit={onLogin}>
-              <label>
-                Login Username
-                <input value={loginUsername} onChange={(event) => setLoginUsername(event.target.value)} />
-              </label>
-              <label>
-                Login Password
-                <input
-                  type="password"
-                  value={loginPassword}
-                  onChange={(event) => setLoginPassword(event.target.value)}
-                />
-              </label>
-              <button disabled={!!busy} type="submit">
-                {busy === "Login user" ? "Logging in..." : "Login"}
-              </button>
-            </form>
-            <p className="inline-note">Token expires: {tokenExpiresAt || "not logged in"}</p>
-          </article>
-
-          <article className="card">
+        <section className="grid">
+          <article className="panel">
             <h2>Network</h2>
-            <form onSubmit={onCreateNetwork}>
+            <p className="inline-info">Step 1: create a network or join with an invite code.</p>
+            <form onSubmit={onCreateNetwork} className="form-stack">
               <label>
-                Network Name
+                New network name
                 <input value={networkName} onChange={(event) => setNetworkName(event.target.value)} />
               </label>
-              <button disabled={!!busy || !canUseAuthedActions} type="submit">
-                {busy === "Create network" ? "Creating..." : "Create Network"}
+              <button disabled={!!busy} type="submit">
+                {busy === "Create network" ? "Creating..." : "Create network"}
               </button>
             </form>
 
-            <form onSubmit={onJoinNetwork}>
+            <form onSubmit={onJoinNetwork} className="form-stack">
               <label>
-                Network ID
+                Join with network ID
                 <input value={joinNetworkId} onChange={(event) => setJoinNetworkId(event.target.value)} />
               </label>
-              <button disabled={!!busy || !canUseAuthedActions} type="submit">
-                {busy === "Join network" ? "Joining..." : "Join Network"}
+              <button disabled={!!busy} type="submit">
+                {busy === "Join network" ? "Joining..." : "Join network"}
               </button>
             </form>
 
-            <div className="row-actions">
-              <button disabled={!!busy || !canUseAuthedActions} onClick={onListPeers}>
-                {busy === "List peers" ? "Loading..." : "List Peers"}
-              </button>
-              <label>
-                Active Network ID
-                <input value={networkId} onChange={(event) => setNetworkId(event.target.value)} />
-              </label>
-            </div>
-
-            <pre>{JSON.stringify(activeNetwork, null, 2)}</pre>
-            <pre>{JSON.stringify(peers, null, 2)}</pre>
+            <p className="inline-info">Active network: {networkId || "none"}</p>
+            {activeNetwork ? <p className="inline-info">Owner: {activeNetwork.owner}</p> : null}
+            {networkId ? (
+              <div className="action-row compact">
+                <button className="secondary" type="button" onClick={onCopyNetworkId}>
+                  Copy invite code
+                </button>
+                <button className="secondary" type="button" onClick={onChangeNetwork}>
+                  Switch network
+                </button>
+              </div>
+            ) : null}
           </article>
+
+          {networkId ? (
+            <article className="panel">
+              <h2>Connect</h2>
+              <p className="inline-info">Step 2: choose what you need and connect to a friend.</p>
+
+              <div className="intent-row">
+                <button
+                  type="button"
+                  className={`intent-btn ${connectIntent === "lan" ? "active" : ""}`}
+                  onClick={() => setConnectIntent("lan")}
+                >
+                  LAN game/app
+                </button>
+                <button
+                  type="button"
+                  className={`intent-btn ${connectIntent === "vpn" ? "active" : ""}`}
+                  onClick={() => setConnectIntent("vpn")}
+                >
+                  Remote VPN
+                </button>
+              </div>
+              <p className="inline-info">Mode: {connectIntentLabel}</p>
+
+              <label>
+                Friend username
+                <input value={peerUsername} onChange={(event) => setPeerUsername(event.target.value)} />
+              </label>
+
+              <div className="action-row">
+                <button disabled={!!busy} onClick={onRefreshPeers}>
+                  {busy === "Refresh peers" ? "Refreshing..." : "Refresh peers"}
+                </button>
+                <button disabled={!!busy} onClick={onConnectPeer}>
+                  {busy === "Connect" ? "Connecting..." : "Connect"}
+                </button>
+              </div>
+
+              <p className={`connection-pill ${runSummary?.final_path ?? "idle"}`}>{connectionLabel}</p>
+              {runSummary ? <p className="inline-info">Reason: {runSummary.final_reason}</p> : null}
+
+              <div className="peer-list">
+                {visiblePeers.length === 0 ? (
+                  <p className="inline-info">No peers available yet.</p>
+                ) : (
+                  visiblePeers.map((peer) => (
+                    <button
+                      key={peer.username}
+                      className="peer-item"
+                      onClick={() => setPeerUsername(peer.username)}
+                    >
+                      {peer.username}
+                    </button>
+                  ))
+                )}
+              </div>
+
+              <details>
+                <summary>Advanced connection settings</summary>
+                <div className="form-stack advanced-grid">
+                  <label>
+                    STUN servers (comma separated)
+                    <input value={stunServersCsv} onChange={(event) => setStunServersCsv(event.target.value)} />
+                  </label>
+                  <label>
+                    Local bind address
+                    <input value={localBindAddr} onChange={(event) => setLocalBindAddr(event.target.value)} />
+                  </label>
+                </div>
+              </details>
+            </article>
+          ) : (
+            <article className="panel muted-panel">
+              <h2>Connect</h2>
+              <p className="inline-info">Create or join a network first, then this section unlocks.</p>
+            </article>
+          )}
         </section>
 
-        <section className="card">
-          <h2>Session Negotiation</h2>
-          <div className="cluster split">
-            <label>
-              Peer Username
-              <input value={peerUsername} onChange={(event) => setPeerUsername(event.target.value)} />
-            </label>
-            <label>
-              STUN Servers (comma separated)
-              <input
-                value={stunServersCsv}
-                onChange={(event) => setStunServersCsv(event.target.value)}
-                placeholder="74.125.250.129:19302"
-              />
-            </label>
-            <label>
-              Local Bind Addr
-              <input value={localBindAddr} onChange={(event) => setLocalBindAddr(event.target.value)} />
-            </label>
-            <label>
-              Session ID (optional)
-              <input value={sessionId} onChange={(event) => setSessionId(event.target.value)} />
-            </label>
-          </div>
-
-          <div className="row-actions">
-            <button disabled={!!busy || !canUseAuthedActions} onClick={onOpenSession}>
-              {busy === "Open session" ? "Opening..." : "Open Session"}
-            </button>
-            <button disabled={!!busy || !canUseAuthedActions} onClick={onRunNegotiation}>
-              {busy === "Run session negotiation" ? "Running..." : "Run Live Negotiation"}
-            </button>
-            <button disabled={!!busy || !canUseAuthedActions} onClick={onFetchSession}>
-              {busy === "Fetch session" ? "Fetching..." : "Fetch Session State"}
-            </button>
-          </div>
-
-          <pre>{JSON.stringify(runSummary, null, 2)}</pre>
-          <pre>{JSON.stringify(sessionSummary, null, 2)}</pre>
-        </section>
-
-        <section className="card stack">
-          <h2>Runtime</h2>
-          {error ? <p className="error-banner">{error}</p> : null}
-          <p className="inline-note">Current action: {busy ?? "idle"}</p>
-          <pre>{eventLog.join("\n")}</pre>
-          <p className="inline-note token">JWT: {accessToken || "none"}</p>
-        </section>
+        {error ? <p className="banner error">{error}</p> : null}
+        <p className="banner status">{statusMessage}</p>
+        <p className="inline-info">Session expires at: {tokenExpiresAt}</p>
       </main>
     </div>
   );

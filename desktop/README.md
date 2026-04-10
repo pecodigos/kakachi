@@ -4,12 +4,11 @@ This desktop app is now implemented as a Tauri shell with a React UI and a Rust 
 
 Current responsibilities:
 
-- Control-plane health check
-- WireGuard key generation
-- User register and login
+- Minimal login-first flow with optional saved login on the same device
+- Create account screen (username, email, password, confirm password)
 - Network creation, join, and peer listing
-- Session open/get
-- Live STUN-backed session negotiation trigger via local agent service, including UDP hole-punch hello/ack telemetry
+- Guided friend connect flow for LAN-style use and remote VPN-style use
+- Live STUN-backed negotiation trigger via local agent service, including UDP hole-punch hello/ack telemetry
 
 ## Architecture Boundary
 
@@ -58,13 +57,13 @@ npm run tauri dev
 
 3. In the desktop UI, execute this flow:
 
-- Check API health
-- Generate WireGuard keypair
-- Register user
-- Login user
-- Create or join network
-- List peers
-- Open session and run live negotiation
+1. Sign in on first screen.
+2. Optional: use `Save login on this device` for next app launch.
+3. If needed, click `Create account` and fill username, email, password, confirm password.
+4. After login, create a network or join with invite code.
+5. Refresh peers, select friend username, and press `Connect`.
+
+Advanced settings are available under `Advanced connection settings`, but normal users can ignore them.
 
 ## Optional Environment Variables
 
