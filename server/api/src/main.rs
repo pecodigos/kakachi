@@ -233,7 +233,9 @@ fn map_coordination_error(err: CoordinationError) -> ApiError {
         CoordinationError::InvalidUsername
         | CoordinationError::WeakPassword
         | CoordinationError::InvalidPublicKey
-        | CoordinationError::InvalidNetworkName => ApiError::bad_request(err.to_string()),
+        | CoordinationError::InvalidNetworkName
+        | CoordinationError::InvalidEndpointCandidate
+        | CoordinationError::TooManyEndpointCandidates => ApiError::bad_request(err.to_string()),
         CoordinationError::UserAlreadyExists => ApiError::conflict(err.to_string()),
         CoordinationError::InvalidCredentials => ApiError::unauthorized(err.to_string()),
         CoordinationError::AccessDenied => ApiError::forbidden(err.to_string()),

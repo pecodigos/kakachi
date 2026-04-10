@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -19,6 +20,8 @@ use uuid::Uuid;
 
 const MIN_PASSWORD_LEN: usize = 12;
 const MAX_NETWORK_NAME_LEN: usize = 64;
+const MAX_ENDPOINT_CANDIDATES: usize = 12;
+const ENDPOINT_CANDIDATE_TTL_SECS: i64 = 300;
 
 #[derive(Debug, Error)]
 pub enum CoordinationError {
@@ -44,6 +47,10 @@ pub enum CoordinationError {
     InconsistentState,
     #[error("internal password hashing failure")]
     PasswordHashFailure,
+    #[error("endpoint candidate is not a valid socket address")]
+    InvalidEndpointCandidate,
+    #[error("too many endpoint candidates, max allowed is {MAX_ENDPOINT_CANDIDATES}")]
+    TooManyEndpointCandidates,
     #[error("storage failure: {0}")]
     StorageFailure(String),
 }
@@ -98,6 +105,19 @@ pub struct NetworkSummary {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EndpointCandidate {
+    pub endpoint: String,
+    pub observed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerEndpointBundle {
+    pub username: String,
+    pub public_key: PublicKey,
+    pub candidates: Vec<EndpointCandidate>,
+}
+
 #[derive(Debug, Clone)]
 struct UserRecord {
     username: String,
@@ -115,10 +135,26 @@ struct NetworkRecord {
     created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone)]
+struct EndpointCandidateRecord {
+    endpoint: String,
+    observed_at: DateTime<Utc>,
+}
+
+impl From<EndpointCandidateRecord> for EndpointCandidate {
+    fn from(value: EndpointCandidateRecord) -> Self {
+        Self {
+            endpoint: value.endpoint,
+            observed_at: value.observed_at,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct LoadedState {
     users: HashMap<String, UserRecord>,
     networks: HashMap<Uuid, NetworkRecord>,
+    endpoint_candidates: HashMap<(Uuid, String), Vec<EndpointCandidateRecord>>,
 }
 
 #[derive(Debug, Clone)]
@@ -170,6 +206,16 @@ impl SqliteCoordinationStorage {
                     FOREIGN KEY(network_id) REFERENCES networks(network_id) ON DELETE CASCADE,
                     FOREIGN KEY(username_lookup) REFERENCES users(username_lookup) ON DELETE CASCADE
                 );
+
+                CREATE TABLE IF NOT EXISTS peer_endpoint_candidates (
+                    network_id TEXT NOT NULL,
+                    username_lookup TEXT NOT NULL,
+                    endpoint TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    PRIMARY KEY (network_id, username_lookup, endpoint),
+                    FOREIGN KEY(network_id) REFERENCES networks(network_id) ON DELETE CASCADE,
+                    FOREIGN KEY(username_lookup) REFERENCES users(username_lookup) ON DELETE CASCADE
+                );
                 ",
             )
             .map_err(sqlite_err)?;
@@ -192,6 +238,7 @@ impl SqliteCoordinationStorage {
         self.with_connection(|conn| {
             let mut users = HashMap::new();
             let mut networks = HashMap::new();
+            let mut endpoint_candidates = HashMap::new();
 
             let mut user_statement = conn
                 .prepare(
@@ -296,7 +343,51 @@ impl SqliteCoordinationStorage {
                 network.member_usernames_lookup.insert(username_lookup);
             }
 
-            Ok(LoadedState { users, networks })
+            let mut candidate_statement = conn
+                .prepare(
+                    "
+                    SELECT network_id, username_lookup, endpoint, observed_at
+                    FROM peer_endpoint_candidates
+                    ",
+                )
+                .map_err(sqlite_err)?;
+
+            let candidate_rows = candidate_statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .map_err(sqlite_err)?;
+
+            for row in candidate_rows {
+                let (network_id_raw, username_lookup, endpoint, observed_at_raw) =
+                    row.map_err(sqlite_err)?;
+                let network_id = Uuid::parse_str(&network_id_raw)
+                    .map_err(|_| CoordinationError::InconsistentState)?;
+
+                let observed_at = parse_rfc3339_utc(&observed_at_raw)?;
+                endpoint_candidates
+                    .entry((network_id, username_lookup))
+                    .or_insert_with(Vec::new)
+                    .push(EndpointCandidateRecord {
+                        endpoint,
+                        observed_at,
+                    });
+            }
+
+            for candidates in endpoint_candidates.values_mut() {
+                candidates.sort_by(|left, right| right.observed_at.cmp(&left.observed_at));
+            }
+
+            Ok(LoadedState {
+                users,
+                networks,
+                endpoint_candidates,
+            })
         })
     }
 
@@ -380,12 +471,55 @@ impl SqliteCoordinationStorage {
             Ok(())
         })
     }
+
+    fn replace_peer_endpoint_candidates(
+        &self,
+        network_id: Uuid,
+        username_lookup: &str,
+        candidates: &[EndpointCandidateRecord],
+    ) -> Result<(), CoordinationError> {
+        self.with_connection(|conn| {
+            let transaction = conn.transaction().map_err(sqlite_err)?;
+
+            transaction
+                .execute(
+                    "
+                    DELETE FROM peer_endpoint_candidates
+                    WHERE network_id = ?1 AND username_lookup = ?2
+                    ",
+                    params![network_id.to_string(), username_lookup],
+                )
+                .map_err(sqlite_err)?;
+
+            for candidate in candidates {
+                transaction
+                    .execute(
+                        "
+                        INSERT INTO peer_endpoint_candidates (
+                            network_id, username_lookup, endpoint, observed_at
+                        ) VALUES (?1, ?2, ?3, ?4)
+                        ",
+                        params![
+                            network_id.to_string(),
+                            username_lookup,
+                            candidate.endpoint,
+                            candidate.observed_at.to_rfc3339(),
+                        ],
+                    )
+                    .map_err(sqlite_err)?;
+            }
+
+            transaction.commit().map_err(sqlite_err)?;
+            Ok(())
+        })
+    }
 }
 
 #[derive(Debug, Default)]
 pub struct ControlPlaneState {
     users: RwLock<HashMap<String, UserRecord>>,
     networks: RwLock<HashMap<Uuid, NetworkRecord>>,
+    endpoint_candidates: RwLock<HashMap<(Uuid, String), Vec<EndpointCandidateRecord>>>,
     storage: Option<SqliteCoordinationStorage>,
 }
 
@@ -401,6 +535,7 @@ impl ControlPlaneState {
         Ok(Self {
             users: RwLock::new(snapshot.users),
             networks: RwLock::new(snapshot.networks),
+            endpoint_candidates: RwLock::new(snapshot.endpoint_candidates),
             storage: Some(storage),
         })
     }
@@ -613,6 +748,95 @@ impl ControlPlaneState {
             created_at: network_record.created_at,
         })
     }
+
+    pub async fn upsert_endpoint_candidates(
+        &self,
+        network_id: Uuid,
+        username: &str,
+        raw_candidates: &[String],
+    ) -> Result<Vec<EndpointCandidate>, CoordinationError> {
+        let username_lookup = normalize_lookup(username);
+
+        {
+            let networks = self.networks.read().await;
+            let network = networks
+                .get(&network_id)
+                .ok_or(CoordinationError::NetworkNotFound)?;
+
+            if !network.member_usernames_lookup.contains(&username_lookup) {
+                return Err(CoordinationError::AccessDenied);
+            }
+        }
+
+        let normalized = normalize_endpoint_candidates(raw_candidates)?;
+
+        if let Some(storage) = &self.storage {
+            storage.replace_peer_endpoint_candidates(network_id, &username_lookup, &normalized)?;
+        }
+
+        let mut endpoint_candidates = self.endpoint_candidates.write().await;
+        endpoint_candidates.insert((network_id, username_lookup), normalized.clone());
+
+        let public_candidates = normalized
+            .into_iter()
+            .map(EndpointCandidate::from)
+            .collect::<Vec<_>>();
+
+        Ok(public_candidates)
+    }
+
+    pub async fn list_network_endpoint_candidates(
+        &self,
+        network_id: Uuid,
+        requester_username: &str,
+    ) -> Result<Vec<PeerEndpointBundle>, CoordinationError> {
+        let requester_lookup = normalize_lookup(requester_username);
+        let member_usernames = {
+            let networks = self.networks.read().await;
+            let network = networks
+                .get(&network_id)
+                .ok_or(CoordinationError::NetworkNotFound)?;
+
+            if !network.member_usernames_lookup.contains(&requester_lookup) {
+                return Err(CoordinationError::AccessDenied);
+            }
+
+            network
+                .member_usernames_lookup
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        let users = self.users.read().await;
+        let endpoint_candidates = self.endpoint_candidates.read().await;
+        let oldest_allowed = Utc::now() - chrono::Duration::seconds(ENDPOINT_CANDIDATE_TTL_SECS);
+
+        let mut bundles = Vec::with_capacity(member_usernames.len());
+        for member_lookup in member_usernames {
+            let user = users
+                .get(&member_lookup)
+                .ok_or(CoordinationError::InconsistentState)?;
+
+            let candidates = endpoint_candidates
+                .get(&(network_id, member_lookup.clone()))
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|candidate| candidate.observed_at >= oldest_allowed)
+                .map(EndpointCandidate::from)
+                .collect::<Vec<_>>();
+
+            bundles.push(PeerEndpointBundle {
+                username: user.username.clone(),
+                public_key: user.public_key.clone(),
+                candidates,
+            });
+        }
+
+        bundles.sort_by(|left, right| left.username.cmp(&right.username));
+        Ok(bundles)
+    }
 }
 
 fn normalize_lookup(username: &str) -> String {
@@ -654,6 +878,39 @@ fn validate_network_name(name: &str) -> Result<(), CoordinationError> {
     }
 
     Ok(())
+}
+
+fn normalize_endpoint_candidates(
+    raw_candidates: &[String],
+) -> Result<Vec<EndpointCandidateRecord>, CoordinationError> {
+    let observed_at = Utc::now();
+    let mut deduplicated = HashSet::new();
+    let mut normalized = Vec::new();
+
+    for candidate in raw_candidates {
+        let trimmed = candidate.trim();
+        if trimmed.is_empty() {
+            return Err(CoordinationError::InvalidEndpointCandidate);
+        }
+
+        let parsed = trimmed
+            .parse::<SocketAddr>()
+            .map_err(|_| CoordinationError::InvalidEndpointCandidate)?;
+        let canonical = parsed.to_string();
+
+        if deduplicated.insert(canonical.clone()) {
+            normalized.push(EndpointCandidateRecord {
+                endpoint: canonical,
+                observed_at,
+            });
+        }
+
+        if normalized.len() > MAX_ENDPOINT_CANDIDATES {
+            return Err(CoordinationError::TooManyEndpointCandidates);
+        }
+    }
+
+    Ok(normalized)
 }
 
 fn hash_password(password: &SecretString) -> Result<String, CoordinationError> {
@@ -757,6 +1014,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn endpoint_candidates_round_trip_for_members() {
+        let state = ControlPlaneState::new();
+        let alice_password = SecretString::new("ValidPassword123".to_owned());
+        let bob_password = SecretString::new("DifferentPass123".to_owned());
+
+        assert!(
+            state
+                .register_user("alice", &alice_password, &fixture_public_key(7))
+                .await
+                .is_ok()
+        );
+        assert!(
+            state
+                .register_user("bob", &bob_password, &fixture_public_key(8))
+                .await
+                .is_ok()
+        );
+
+        let network = state.create_network("alice", "friends").await;
+        assert!(network.is_ok());
+        let network_id = if let Ok(summary) = network {
+            summary.network_id
+        } else {
+            Uuid::nil()
+        };
+        assert_ne!(network_id, Uuid::nil());
+
+        assert!(state.join_network(network_id, "bob").await.is_ok());
+
+        let update = state
+            .upsert_endpoint_candidates(
+                network_id,
+                "bob",
+                &[
+                    "203.0.113.10:51820".to_owned(),
+                    "203.0.113.11:51820".to_owned(),
+                ],
+            )
+            .await;
+        assert!(update.is_ok());
+
+        let listed = state
+            .list_network_endpoint_candidates(network_id, "alice")
+            .await;
+        assert!(listed.is_ok());
+
+        let listed = if let Ok(value) = listed {
+            value
+        } else {
+            return;
+        };
+        let bob_bundle = listed.iter().find(|entry| entry.username == "bob");
+        assert!(bob_bundle.is_some());
+        let bob_candidates_len = if let Some(bundle) = bob_bundle {
+            bundle.candidates.len()
+        } else {
+            0
+        };
+        assert_eq!(bob_candidates_len, 2);
+    }
+
+    #[tokio::test]
+    async fn endpoint_candidates_reject_invalid_socket_addr() {
+        let state = ControlPlaneState::new();
+        let alice_password = SecretString::new("ValidPassword123".to_owned());
+
+        assert!(
+            state
+                .register_user("alice", &alice_password, &fixture_public_key(9))
+                .await
+                .is_ok()
+        );
+
+        let network = state.create_network("alice", "friends").await;
+        assert!(network.is_ok());
+        let network_id = if let Ok(summary) = network {
+            summary.network_id
+        } else {
+            Uuid::nil()
+        };
+        assert_ne!(network_id, Uuid::nil());
+
+        let update = state
+            .upsert_endpoint_candidates(network_id, "alice", &["not-an-endpoint".to_owned()])
+            .await;
+        assert!(update.is_err());
+    }
+
+    #[tokio::test]
     async fn sqlite_storage_survives_restart() {
         let database_path =
             std::env::temp_dir().join(format!("kakachi-coordination-{}.db", Uuid::new_v4()));
@@ -794,6 +1140,12 @@ mod tests {
             assert_ne!(network_id, Uuid::nil());
             let join = state.join_network(network_id, "bob").await;
             assert!(join.is_ok());
+
+            let update = state
+                .upsert_endpoint_candidates(network_id, "bob", &["198.51.100.42:51820".to_owned()])
+                .await;
+            assert!(update.is_ok());
+
             network_id
         };
 
@@ -814,6 +1166,28 @@ mod tests {
             0
         };
         assert_eq!(peer_count, 2);
+
+        let endpoints = reloaded
+            .list_network_endpoint_candidates(created_network_id, "alice")
+            .await;
+        assert!(endpoints.is_ok());
+
+        let endpoints = if let Ok(value) = endpoints {
+            value
+        } else {
+            cleanup_sqlite_files(&database_path);
+            return;
+        };
+
+        let bob_bundle = endpoints.iter().find(|entry| entry.username == "bob");
+        assert!(bob_bundle.is_some());
+
+        let candidate_count = if let Some(bundle) = bob_bundle {
+            bundle.candidates.len()
+        } else {
+            0
+        };
+        assert_eq!(candidate_count, 1);
 
         cleanup_sqlite_files(&database_path);
     }

@@ -102,13 +102,15 @@ cargo run -p kakachi-agent --bin agentd
 - GET /v1/networks/{network_id}
 - POST /v1/networks/{network_id}/join
 - GET /v1/networks/{network_id}/peers
+- POST /v1/networks/{network_id}/endpoint-candidates
+- GET /v1/networks/{network_id}/endpoint-candidates
 - GET /v1/ws?token=<jwt>&network_id=<uuid>
 
 ## Current Risks And Gaps
 
 - API currently runs over HTTP locally; TLS termination and cert management still required for deployment.
 - Coordination persistence currently uses a single-node SQLite file without schema migrations yet.
-- NAT traversal and relay transport are modeled but not fully wired into live packet flow.
+- NAT endpoint metadata exchange exists, but direct hole-punching and relay packet forwarding are not fully wired yet.
 - Desktop UI is not started yet (planned for Tauri + React in Phase 3).
 
 ## Next Slice
