@@ -683,6 +683,7 @@ dependencies = [
  "argon2",
  "base64",
  "chrono",
+ "kakachi-net",
  "rand 0.8.5",
  "regex",
  "rusqlite",
