@@ -281,6 +281,15 @@ button:disabled {
   color: #164a74;
 }
 
+.quick-connect {
+  width: 100%;
+  margin-top: 0.55rem;
+  margin-bottom: 0.25rem;
+  padding: 0.78rem 0.9rem;
+  font-size: 1rem;
+  background: linear-gradient(135deg, #0a7b58 0%, #0c936b 100%);
+}
+
 .inline-info {
   margin: 0.4rem 0 0;
   color: var(--ink-muted);
@@ -306,7 +315,10 @@ button:disabled {
 }
 
 details {
-  margin-top: 0.8rem;
+  margin-top: 0.9rem;
+  border: 1px dashed #c5d6e2;
+  border-radius: 12px;
+  padding: 0.55rem 0.65rem;
 }
 
 summary {

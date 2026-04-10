@@ -8,6 +8,7 @@ Current responsibilities:
 - Create account screen (username, email, password, confirm password)
 - Network creation, join, and peer listing
 - Guided friend connect flow for LAN-style use and remote VPN-style use
+- One-click `Quick connect` that auto-discovers online peers and picks the safest available path
 - Live STUN-backed negotiation trigger via local agent service, including UDP hole-punch hello/ack telemetry
 
 ## Architecture Boundary
@@ -61,7 +62,10 @@ npm run tauri dev
 2. Optional: use `Save login on this device` for next app launch.
 3. If needed, click `Create account` and fill username, email, password, confirm password.
 4. After login, create a network or join with invite code.
-5. Refresh peers, select friend username, and press `Connect`.
+5. Choose LAN game/app or Remote VPN mode.
+6. Press `Quick connect`.
+
+Manual friend selection is available under `Manual friend selection`.
 
 Advanced settings are available under `Advanced connection settings`, but normal users can ignore them.
 

@@ -24,6 +24,55 @@ interface SavedLogin {
 const SAVED_LOGIN_KEY = "kakachi.saved-login.v1";
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
+function toFriendlyError(rawMessage: string): string {
+  const message = rawMessage.trim();
+  const normalized = message.toLowerCase();
+
+  if (normalized.includes("no_peers_available")) {
+    return "No friends are online in this network yet. Ask them to join and try again.";
+  }
+
+  if (
+    normalized.includes("401") ||
+    normalized.includes("unauthorized") ||
+    normalized.includes("invalid token") ||
+    normalized.includes("expired")
+  ) {
+    return "Your sign-in session expired. Please sign in again.";
+  }
+
+  if (normalized.includes("network_id") && normalized.includes("uuid")) {
+    return "That invite code is not valid. Check the network ID and try again.";
+  }
+
+  if (normalized.includes("control_plane_url") || normalized.includes("http/https/ws/wss")) {
+    return "The server address looks invalid. Use something like http://127.0.0.1:8080.";
+  }
+
+  if (
+    normalized.includes("connection refused") ||
+    normalized.includes("dns") ||
+    normalized.includes("timed out") ||
+    normalized.includes("failed to send request")
+  ) {
+    return "Kakachi could not reach the server. Check if backend is running and your address is correct.";
+  }
+
+  if (normalized.includes("already exists") || normalized.includes("duplicate")) {
+    return "This username is already taken. Choose another username.";
+  }
+
+  if (normalized.includes("peer") && normalized.includes("not")) {
+    return "Could not find this friend in your network. Refresh peers and try again.";
+  }
+
+  if (normalized.includes("stun")) {
+    return "Could not establish a direct path right now. Kakachi can still try relay mode.";
+  }
+
+  return message || "Something went wrong. Please try again.";
+}
+
 function readSavedLogin(): SavedLogin | null {
   if (typeof window === "undefined") {
     return null;
@@ -160,9 +209,10 @@ export default function App() {
       const value = await operation();
       onSuccess(value);
     } catch (err) {
-      const message = err instanceof Error ? err.message : "Unexpected error";
-      setError(message);
-      setStatusMessage(`${label} failed.`);
+      const technicalMessage = err instanceof Error ? err.message : "Unexpected error";
+      const friendlyMessage = toFriendlyError(technicalMessage);
+      setError(friendlyMessage);
+      setStatusMessage(`${label} failed. ${friendlyMessage}`);
     } finally {
       setBusy(null);
     }
@@ -404,6 +454,56 @@ export default function App() {
     );
   }
 
+  async function onQuickConnect() {
+    if (!requireAuth()) return;
+    if (!networkId) {
+      setError("Create or join a network first.");
+      return;
+    }
+
+    if (parsedStunServers.length === 0) {
+      setError("Add at least one STUN server in advanced settings.");
+      return;
+    }
+
+    await runAction(
+      "Quick connect",
+      async () => {
+        const peerList = await listPeers({
+          control_plane_url: controlPlaneUrl,
+          access_token: accessToken,
+          network_id: networkId
+        });
+
+        const candidates = peerList.filter((peer) => peer.username !== currentUsername);
+        if (candidates.length === 0) {
+          throw new Error("NO_PEERS_AVAILABLE");
+        }
+
+        const selectedPeer = peerUsername.trim() || candidates[0].username;
+        const summary = await runSessionProbe({
+          control_plane_url: controlPlaneUrl,
+          access_token: accessToken,
+          network_id: networkId,
+          peer_username: selectedPeer,
+          stun_servers: parsedStunServers,
+          local_bind_addr: localBindAddr,
+          session_id: runSummary?.session_id
+        });
+
+        return { selectedPeer, summary, peerList };
+      },
+      ({ selectedPeer, summary, peerList }) => {
+        setPeers(peerList);
+        setPeerUsername(selectedPeer);
+        setRunSummary(summary);
+        const pathLabel = summary.final_path === "direct" ? "direct LAN tunnel" : "relay tunnel";
+        const usage = connectIntent === "lan" ? "LAN apps" : "VPN traffic";
+        setStatusMessage(`Connected to ${selectedPeer} for ${usage} using ${pathLabel}.`);
+      }
+    );
+  }
+
   async function onConnectPeer() {
     if (!requireAuth()) return;
     if (!networkId) {
@@ -623,38 +723,46 @@ export default function App() {
               </div>
               <p className="inline-info">Mode: {connectIntentLabel}</p>
 
-              <label>
-                Friend username
-                <input value={peerUsername} onChange={(event) => setPeerUsername(event.target.value)} />
-              </label>
-
-              <div className="action-row">
-                <button disabled={!!busy} onClick={onRefreshPeers}>
-                  {busy === "Refresh peers" ? "Refreshing..." : "Refresh peers"}
-                </button>
-                <button disabled={!!busy} onClick={onConnectPeer}>
-                  {busy === "Connect" ? "Connecting..." : "Connect"}
-                </button>
-              </div>
+              <button className="quick-connect" disabled={!!busy} onClick={onQuickConnect}>
+                {busy === "Quick connect" ? "Connecting..." : "Quick connect"}
+              </button>
+              <p className="inline-info">This automatically finds online friends and connects with safest path.</p>
 
               <p className={`connection-pill ${runSummary?.final_path ?? "idle"}`}>{connectionLabel}</p>
               {runSummary ? <p className="inline-info">Reason: {runSummary.final_reason}</p> : null}
 
-              <div className="peer-list">
-                {visiblePeers.length === 0 ? (
-                  <p className="inline-info">No peers available yet.</p>
-                ) : (
-                  visiblePeers.map((peer) => (
-                    <button
-                      key={peer.username}
-                      className="peer-item"
-                      onClick={() => setPeerUsername(peer.username)}
-                    >
-                      {peer.username}
-                    </button>
-                  ))
-                )}
-              </div>
+              <details>
+                <summary>Manual friend selection</summary>
+                <label>
+                  Friend username
+                  <input value={peerUsername} onChange={(event) => setPeerUsername(event.target.value)} />
+                </label>
+
+                <div className="action-row">
+                  <button disabled={!!busy} onClick={onRefreshPeers}>
+                    {busy === "Refresh peers" ? "Refreshing..." : "Refresh peers"}
+                  </button>
+                  <button disabled={!!busy} onClick={onConnectPeer}>
+                    {busy === "Connect" ? "Connecting..." : "Connect manually"}
+                  </button>
+                </div>
+
+                <div className="peer-list">
+                  {visiblePeers.length === 0 ? (
+                    <p className="inline-info">No peers available yet.</p>
+                  ) : (
+                    visiblePeers.map((peer) => (
+                      <button
+                        key={peer.username}
+                        className="peer-item"
+                        onClick={() => setPeerUsername(peer.username)}
+                      >
+                        {peer.username}
+                      </button>
+                    ))
+                  )}
+                </div>
+              </details>
 
               <details>
                 <summary>Advanced connection settings</summary>
