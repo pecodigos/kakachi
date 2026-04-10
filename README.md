@@ -115,3 +115,7 @@ cargo run -p kakachi-agent --bin agentd
 - Add persistent server-side storage (accounts, networks, membership).
 - Introduce DTLS/QUIC or UDP session manager for direct peer session establishment.
 - Implement deterministic relay path for VPN packets and chat payload transport.
+
+## Project Governance
+
+- Versioning and source-control workflow: [docs/versioning-control-plan.md](docs/versioning-control-plan.md)
