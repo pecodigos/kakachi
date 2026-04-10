@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = [
+    "core/agent",
+    "core/chat",
+    "core/net",
+    "core/wg",
+    "server/api",
+    "server/coordination",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+authors = ["Kakachi Contributors"]
+
+[workspace.dependencies]
+anyhow = "1.0.98"
+argon2 = { version = "0.5.3", features = ["std"] }
+axum = { version = "0.8.4", features = ["json", "macros", "ws"] }
+base64 = "0.22.1"
+chrono = { version = "0.4.41", features = ["clock", "serde"] }
+ipnet = { version = "2.11.0", features = ["serde"] }
+jsonwebtoken = "9.3.1"
+rand = "0.8.5"
+regex = "1.11.1"
+rusqlite = { version = "0.32.1", features = ["bundled", "chrono"] }
+secrecy = { version = "0.8.0", features = ["serde"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+thiserror = "2.0.16"
+tokio = { version = "1.47.1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tower-http = { version = "0.6.6", features = ["cors", "request-id", "trace"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
+uuid = { version = "1.18.1", features = ["serde", "v4"] }
+zeroize = { version = "1.8.1", features = ["zeroize_derive"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+expect_used = "deny"
+todo = "deny"
+unwrap_used = "deny"

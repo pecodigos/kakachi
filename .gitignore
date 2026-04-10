@@ -1,0 +1,26 @@
+/target/
+**/*.rs.bk
+
+# Local environment secrets
+.env
+.env.*
+
+# Local Kakachi runtime data
+/.kakachi/
+*.db
+*.db-shm
+*.db-wal
+*.log
+
+# Local private key material
+*.pem
+*.key
+*.p12
+*.pfx
+
+# OS/editor noise
+.DS_Store
+.idea/
+
+# VS Code workspace-specific state
+.vscode/
