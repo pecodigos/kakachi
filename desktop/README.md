@@ -7,7 +7,9 @@ Current responsibilities:
 - Minimal login-first flow with optional saved login on the same device
 - Saved login is stored through desktop secure storage (OS keyring via Tauri backend)
 - Create account screen (username, email, password, confirm password)
-- Network creation, join, and peer listing
+- Network creation and join
+- Power toggle (`On`/`Off`) for connection lifecycle
+- Server list as the primary surface (Hamachi-style)
 - Guided friend connect flow for LAN-style use and remote VPN-style use
 - One-click `Quick connect` that ranks typed friend, preferred friend, then best online candidate
 - Peer presence hints (`online`, `recent`, `unknown`) based on endpoint candidate freshness
@@ -65,9 +67,11 @@ npm run tauri dev
 2. Optional: use `Save login on this device` for next app launch.
 3. If needed, click `Create account` and fill username, email, password, confirm password.
 4. After login, create a network or join with invite code.
-5. Choose LAN game/app or Remote VPN mode.
-6. Press `Quick connect`.
-7. If Kakachi auto-selects a friend, confirm before connecting.
+5. Use the power button (`On`/`Off`) to enable or pause connectivity.
+6. Select a server from the server list.
+7. Choose LAN game/app or Remote VPN mode.
+8. Press `Quick connect`.
+9. If Kakachi auto-selects a friend, confirm before connecting.
 
 Manual friend selection is available under `Manual friend selection`.
 Quick connect learns your last successful friend per network and prefers that friend when available.

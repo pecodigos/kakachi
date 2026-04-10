@@ -288,6 +288,7 @@ export default function App() {
   const [networkName, setNetworkName] = useState("friends-network");
   const [networkId, setNetworkId] = useState("");
   const [joinNetworkId, setJoinNetworkId] = useState("");
+  const [serverList, setServerList] = useState<NetworkSummary[]>([]);
   const [peers, setPeers] = useState<PeerIdentity[]>([]);
   const [peerPresence, setPeerPresence] = useState<Record<string, PresenceHint>>({});
   const [activeNetwork, setActiveNetwork] = useState<NetworkSummary | null>(null);
@@ -301,6 +302,7 @@ export default function App() {
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [secureStorageState, setSecureStorageState] = useState<SecureStorageState>("unknown");
+  const [isPowerOn, setIsPowerOn] = useState(true);
 
   const canUseAuthedActions = accessToken.trim().length > 0 && currentUsername.trim().length > 0;
 
@@ -360,6 +362,8 @@ export default function App() {
 
   const connectIntentLabel = connectIntent === "lan" ? "LAN party mode" : "Remote VPN mode";
   const preferredPeer = networkId ? preferredPeers[networkId] : undefined;
+  const activeServer =
+    (networkId ? serverList.find((server) => server.network_id === networkId) : undefined) ?? activeNetwork;
 
   function resetNetworkState() {
     setNetworkId("");
@@ -369,6 +373,49 @@ export default function App() {
     setPeerUsername("");
     setRunSummary(null);
     setActiveNetwork(null);
+  }
+
+  function upsertServer(summary: NetworkSummary) {
+    setServerList((current) => {
+      const existing = current.filter((item) => item.network_id !== summary.network_id);
+      return [summary, ...existing];
+    });
+  }
+
+  function requirePowerOn(): boolean {
+    if (!isPowerOn) {
+      setError("Turn on power to manage or connect servers.");
+      return false;
+    }
+
+    return true;
+  }
+
+  function onTogglePower() {
+    const nextPowerState = !isPowerOn;
+    setIsPowerOn(nextPowerState);
+    setError(null);
+
+    if (!nextPowerState) {
+      setRunSummary(null);
+      setStatusMessage("Power off. Server sessions are paused.");
+      return;
+    }
+
+    setStatusMessage("Power on. Ready to connect.");
+  }
+
+  function onSelectServer(server: NetworkSummary) {
+    setActiveNetwork(server);
+    setNetworkId(server.network_id);
+    setJoinNetworkId(server.network_id);
+    setPeerUsername("");
+    setRunSummary(null);
+    setStatusMessage(`Selected server ${server.name}.`);
+
+    if (isPowerOn) {
+      void onRefreshPeers(server.network_id);
+    }
   }
 
   function rememberPreferredPeer(currentNetworkId: string, username: string) {
@@ -493,7 +540,7 @@ export default function App() {
         setTokenExpiresAt(response.expires_at);
         setCurrentUsername(username);
         setLoginPassword("");
-        setStatusMessage(`Welcome, ${username}.`);
+        setStatusMessage("");
 
         if (saveLogin) {
           const session: SavedLoginSession = {
@@ -535,7 +582,7 @@ export default function App() {
     setTokenExpiresAt(savedLogin.expires_at);
     setControlPlaneUrl(savedLogin.control_plane_url);
     setError(null);
-    setStatusMessage(`Welcome back, ${savedLogin.username}.`);
+    setStatusMessage("");
   }
 
   function onLogout() {
@@ -543,6 +590,8 @@ export default function App() {
     setTokenExpiresAt("");
     setCurrentUsername("");
     setLoginPassword("");
+    setServerList([]);
+    setIsPowerOn(true);
     setError(null);
     setStatusMessage("Signed out.");
     resetNetworkState();
@@ -571,6 +620,7 @@ export default function App() {
   async function onCreateNetwork(event: FormEvent) {
     event.preventDefault();
     if (!requireAuth()) return;
+    if (!requirePowerOn()) return;
 
     const trimmedName = networkName.trim();
     if (!trimmedName) {
@@ -587,6 +637,7 @@ export default function App() {
           name: trimmedName
         }),
       (response) => {
+        upsertServer(response);
         setActiveNetwork(response);
         setNetworkId(response.network_id);
         setJoinNetworkId(response.network_id);
@@ -599,6 +650,7 @@ export default function App() {
   async function onJoinNetwork(event: FormEvent) {
     event.preventDefault();
     if (!requireAuth()) return;
+    if (!requirePowerOn()) return;
 
     const trimmedNetworkId = joinNetworkId.trim();
     if (!trimmedNetworkId) {
@@ -615,6 +667,7 @@ export default function App() {
           network_id: trimmedNetworkId
         }),
       (response) => {
+        upsertServer(response);
         setActiveNetwork(response);
         setNetworkId(response.network_id);
         setPeerPresence({});
@@ -623,9 +676,11 @@ export default function App() {
     );
   }
 
-  async function onRefreshPeers() {
+  async function onRefreshPeers(targetNetworkId?: string) {
     if (!requireAuth()) return;
-    if (!networkId) {
+    if (!requirePowerOn()) return;
+    const selectedNetworkId = targetNetworkId ?? networkId;
+    if (!selectedNetworkId) {
       setError("Create or join a network first.");
       return;
     }
@@ -636,7 +691,7 @@ export default function App() {
         const peerList = await listPeers({
           control_plane_url: controlPlaneUrl,
           access_token: accessToken,
-          network_id: networkId
+          network_id: selectedNetworkId
         });
 
         let endpointBundles: PeerEndpointBundle[] = [];
@@ -644,7 +699,7 @@ export default function App() {
           endpointBundles = await listPeerEndpointBundles({
             control_plane_url: controlPlaneUrl,
             access_token: accessToken,
-            network_id: networkId
+            network_id: selectedNetworkId
           });
         } catch {
           endpointBundles = [];
@@ -677,6 +732,7 @@ export default function App() {
 
   async function onQuickConnect() {
     if (!requireAuth()) return;
+    if (!requirePowerOn()) return;
     if (!networkId) {
       setError("Create or join a network first.");
       return;
@@ -760,6 +816,7 @@ export default function App() {
 
   async function onConnectPeer() {
     if (!requireAuth()) return;
+    if (!requirePowerOn()) return;
     if (!networkId) {
       setError("Create or join a network first.");
       return;
@@ -904,23 +961,41 @@ export default function App() {
           <div>
             <p className="badge">KAKACHI</p>
             <h1>Your Private LAN</h1>
-            <p className="supporting-copy">Signed in as {currentUsername}</p>
+            <p className="supporting-copy">
+              Sign in as <span className="username-accent">{currentUsername}</span>
+            </p>
           </div>
-          <button className="secondary" onClick={onLogout}>
-            Log out
-          </button>
+          <div className="topbar-actions">
+            <button
+              type="button"
+              className={`power-btn ${isPowerOn ? "on" : "off"}`}
+              onClick={onTogglePower}
+              aria-label={isPowerOn ? "Turn power off" : "Turn power on"}
+            >
+              <span className="power-symbol">⏻</span>
+              <span>{isPowerOn ? "On" : "Off"}</span>
+            </button>
+            <button className="secondary" onClick={onLogout}>
+              Log out
+            </button>
+          </div>
         </header>
 
         <section className="grid">
           <article className="panel">
-            <h2>Network</h2>
-            <p className="inline-info">Step 1: create a network or join with an invite code.</p>
+            <div className="section-head">
+              <h2>Servers</h2>
+              <span className={`power-state ${isPowerOn ? "on" : "off"}`}>
+                {isPowerOn ? "Online" : "Offline"}
+              </span>
+            </div>
+            <p className="inline-info">Create or join a network, then pick it from the list.</p>
             <form onSubmit={onCreateNetwork} className="form-stack">
               <label>
                 New network name
                 <input value={networkName} onChange={(event) => setNetworkName(event.target.value)} />
               </label>
-              <button disabled={!!busy} type="submit">
+              <button disabled={!!busy || !isPowerOn} type="submit">
                 {busy === "Create network" ? "Creating..." : "Create network"}
               </button>
             </form>
@@ -930,29 +1005,62 @@ export default function App() {
                 Join with network ID
                 <input value={joinNetworkId} onChange={(event) => setJoinNetworkId(event.target.value)} />
               </label>
-              <button disabled={!!busy} type="submit">
+              <button disabled={!!busy || !isPowerOn} type="submit">
                 {busy === "Join network" ? "Joining..." : "Join network"}
               </button>
             </form>
 
-            <p className="inline-info">Active network: {networkId || "none"}</p>
-            {activeNetwork ? <p className="inline-info">Owner: {activeNetwork.owner}</p> : null}
+            <div className="server-list">
+              {serverList.length === 0 ? (
+                <p className="inline-info">No servers yet. Create or join your first one.</p>
+              ) : (
+                serverList.map((server) => (
+                  <button
+                    key={server.network_id}
+                    type="button"
+                    className={`server-item ${networkId === server.network_id ? "active" : ""}`}
+                    onClick={() => onSelectServer(server)}
+                  >
+                    <span className={`server-dot ${isPowerOn ? "on" : "off"}`} />
+                    <span className="server-main">
+                      <span className="server-name">{server.name}</span>
+                      <span className="server-sub">{server.members.length} member(s)</span>
+                    </span>
+                    <span className="server-tail">{server.members.length}</span>
+                  </button>
+                ))
+              )}
+            </div>
+
             {networkId ? (
               <div className="action-row compact">
+                <button className="secondary" type="button" onClick={onChangeNetwork}>
+                  Clear active server
+                </button>
                 <button className="secondary" type="button" onClick={onCopyNetworkId}>
                   Copy invite code
-                </button>
-                <button className="secondary" type="button" onClick={onChangeNetwork}>
-                  Switch network
                 </button>
               </div>
             ) : null}
           </article>
 
-          {networkId ? (
+          {networkId && activeServer ? (
             <article className="panel">
               <h2>Connect</h2>
-              <p className="inline-info">Step 2: choose what you need and connect to a friend.</p>
+              <p className="inline-info">Active server: {activeServer.name}</p>
+
+              <div className="action-row compact">
+                <button disabled={!!busy || !isPowerOn} onClick={() => onRefreshPeers()}>
+                  {busy === "Refresh peers" ? "Refreshing..." : "Refresh peers"}
+                </button>
+                <button className="secondary" type="button" onClick={onCopyNetworkId}>
+                  Copy invite code
+                </button>
+              </div>
+
+              {!isPowerOn ? (
+                <p className="inline-info">Power is off. Turn it on to connect to this server.</p>
+              ) : null}
 
               <div className="intent-row">
                 <button
@@ -972,7 +1080,38 @@ export default function App() {
               </div>
               <p className="inline-info">Mode: {connectIntentLabel}</p>
 
-              <button className="quick-connect" disabled={!!busy} onClick={onQuickConnect}>
+              <label>
+                Friend username
+                <input value={peerUsername} onChange={(event) => setPeerUsername(event.target.value)} />
+              </label>
+
+              <div className="peer-list">
+                {visiblePeers.length === 0 ? (
+                  <p className="inline-info">No peers available yet.</p>
+                ) : (
+                  visiblePeers.map((peer) => {
+                    const hint = peerPresence[peer.username];
+                    const status = hint?.state ?? "unknown";
+                    return (
+                      <button
+                        key={peer.username}
+                        type="button"
+                        className="peer-item"
+                        onClick={() => setPeerUsername(peer.username)}
+                      >
+                        <span className="server-dot on" />
+                        <span className="peer-details">
+                          <span className="peer-name">{peer.username}</span>
+                          <span className="peer-last-seen">{presenceTimeLabel(hint)}</span>
+                        </span>
+                        <span className={`peer-presence ${status}`}>{presenceLabel(status)}</span>
+                      </button>
+                    );
+                  })
+                )}
+              </div>
+
+              <button className="quick-connect" disabled={!!busy || !isPowerOn} onClick={onQuickConnect}>
                 {busy === "Quick connect" ? "Connecting..." : "Quick connect"}
               </button>
               <p className="inline-info">
@@ -989,43 +1128,15 @@ export default function App() {
               {runSummary ? <p className="inline-info">Reason: {runSummary.final_reason}</p> : null}
 
               <details>
-                <summary>Manual friend selection</summary>
-                <label>
-                  Friend username
-                  <input value={peerUsername} onChange={(event) => setPeerUsername(event.target.value)} />
-                </label>
+                <summary>Manual controls</summary>
 
                 <div className="action-row">
-                  <button disabled={!!busy} onClick={onRefreshPeers}>
+                  <button disabled={!!busy || !isPowerOn} onClick={() => onRefreshPeers()}>
                     {busy === "Refresh peers" ? "Refreshing..." : "Refresh peers"}
                   </button>
-                  <button disabled={!!busy} onClick={onConnectPeer}>
+                  <button disabled={!!busy || !isPowerOn} onClick={onConnectPeer}>
                     {busy === "Connect" ? "Connecting..." : "Connect manually"}
                   </button>
-                </div>
-
-                <div className="peer-list">
-                  {visiblePeers.length === 0 ? (
-                    <p className="inline-info">No peers available yet.</p>
-                  ) : (
-                    visiblePeers.map((peer) => {
-                      const hint = peerPresence[peer.username];
-                      const status = hint?.state ?? "unknown";
-                      return (
-                        <button
-                          key={peer.username}
-                          className="peer-item"
-                          onClick={() => setPeerUsername(peer.username)}
-                        >
-                          <span className="peer-details">
-                            <span className="peer-name">{peer.username}</span>
-                            <span className="peer-last-seen">{presenceTimeLabel(hint)}</span>
-                          </span>
-                          <span className={`peer-presence ${status}`}>{presenceLabel(status)}</span>
-                        </button>
-                      );
-                    })
-                  )}
                 </div>
               </details>
 
@@ -1046,7 +1157,7 @@ export default function App() {
           ) : (
             <article className="panel muted-panel">
               <h2>Connect</h2>
-              <p className="inline-info">Create or join a network first, then this section unlocks.</p>
+              <p className="inline-info">Create or join a server, then select it from the list.</p>
             </article>
           )}
         </section>
