@@ -16,6 +16,8 @@ use tracing::info;
 use uuid::Uuid;
 
 const MAX_CONTROL_PLANE_ERROR_BODY_LEN: usize = 512;
+const KEYRING_SERVICE: &str = "kakachi-desktop";
+const KEYRING_ACCOUNT: &str = "saved-login";
 
 #[derive(Debug, Error)]
 enum DesktopError {
@@ -29,6 +31,10 @@ enum DesktopError {
     Agent(#[from] kakachi_agent::AgentError),
     #[error("control-plane request failed with status {status}: {message}")]
     ControlPlaneStatus { status: u16, message: String },
+    #[error("secure storage error: {0}")]
+    SecureStorage(#[from] keyring::Error),
+    #[error("serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
 }
 
 #[derive(Clone)]
@@ -192,6 +198,10 @@ fn sanitize_component(raw: &str) -> String {
     item
 }
 
+fn keyring_entry() -> Result<keyring::Entry, DesktopError> {
+    keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT).map_err(DesktopError::from)
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct ControlPlaneInput {
     control_plane_url: String,
@@ -253,6 +263,11 @@ struct ListPeersInput {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct SaveLoginSessionInput {
+    session: SavedLoginSession,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct OpenSessionInput {
     control_plane_url: String,
     access_token: String,
@@ -280,9 +295,30 @@ struct RunNegotiationInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct SavedLoginSession {
+    control_plane_url: String,
+    username: String,
+    access_token: String,
+    expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct PeerIdentityResponse {
     username: String,
     public_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct EndpointCandidateResponse {
+    endpoint: String,
+    observed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PeerEndpointBundleResponse {
+    username: String,
+    public_key: String,
+    candidates: Vec<EndpointCandidateResponse>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -427,6 +463,56 @@ async fn list_peers(
 }
 
 #[tauri::command]
+async fn list_peer_endpoint_bundles(
+    state: tauri::State<'_, RuntimeState>,
+    input: ListPeersInput,
+) -> Result<Vec<PeerEndpointBundleResponse>, String> {
+    let network_id =
+        parse_uuid_field(&input.network_id, "network_id").map_err(|e| e.to_string())?;
+
+    let api = ApiClient::new(state.http.clone(), &input.control_plane_url)
+        .map_err(|error| error.to_string())?;
+
+    let path = format!("/v1/networks/{network_id}/endpoint-candidates");
+    api.get_json(&path, Some(input.access_token.trim()))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn save_login_session(input: SaveLoginSessionInput) -> Result<(), String> {
+    let entry = keyring_entry().map_err(|error| error.to_string())?;
+    let serialized = serde_json::to_string(&input.session).map_err(|error| error.to_string())?;
+
+    entry
+        .set_password(&serialized)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn load_login_session() -> Result<Option<SavedLoginSession>, String> {
+    let entry = keyring_entry().map_err(|error| error.to_string())?;
+
+    match entry.get_password() {
+        Ok(serialized) => serde_json::from_str(&serialized)
+            .map(Some)
+            .map_err(|error| error.to_string()),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+#[tauri::command]
+fn clear_login_session() -> Result<(), String> {
+    let entry = keyring_entry().map_err(|error| error.to_string())?;
+
+    match entry.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+#[tauri::command]
 async fn open_session_negotiation(
     input: OpenSessionInput,
 ) -> Result<SessionNegotiationSummary, String> {
@@ -538,9 +624,13 @@ pub fn run() {
             generate_wireguard_identity,
             register_user,
             login_user,
+            save_login_session,
+            load_login_session,
+            clear_login_session,
             create_network,
             join_network,
             list_peers,
+            list_peer_endpoint_bundles,
             open_session_negotiation,
             get_session_negotiation,
             run_session_negotiation,

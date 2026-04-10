@@ -5,10 +5,12 @@ This desktop app is now implemented as a Tauri shell with a React UI and a Rust 
 Current responsibilities:
 
 - Minimal login-first flow with optional saved login on the same device
+- Saved login is stored through desktop secure storage (OS keyring via Tauri backend)
 - Create account screen (username, email, password, confirm password)
 - Network creation, join, and peer listing
 - Guided friend connect flow for LAN-style use and remote VPN-style use
-- One-click `Quick connect` that auto-discovers online peers and picks the safest available path
+- One-click `Quick connect` that ranks typed friend, preferred friend, then best online candidate
+- Peer presence hints (`online`, `recent`, `unknown`) based on endpoint candidate freshness
 - Live STUN-backed negotiation trigger via local agent service, including UDP hole-punch hello/ack telemetry
 
 ## Architecture Boundary
@@ -66,6 +68,7 @@ npm run tauri dev
 6. Press `Quick connect`.
 
 Manual friend selection is available under `Manual friend selection`.
+Quick connect learns your last successful friend per network and prefers that friend when available.
 
 Advanced settings are available under `Advanced connection settings`, but normal users can ignore them.
 

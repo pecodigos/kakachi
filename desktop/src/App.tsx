@@ -1,28 +1,41 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import {
+  clearLoginSession,
   createNetwork,
   generateWireguardIdentity,
+  listPeerEndpointBundles,
   joinNetwork,
+  loadLoginSession,
   listPeers,
   loginUser,
   registerUser,
   runSessionProbe,
+  saveLoginSession,
   type NegotiationRunSummary,
   type NetworkSummary,
-  type PeerIdentity
+  type PeerEndpointBundle,
+  type PeerIdentity,
+  type SavedLoginSession
 } from "./lib/tauri";
 
 type AuthView = "login" | "register";
+type PresenceState = "online" | "recent" | "unknown";
 
-interface SavedLogin {
-  controlPlaneUrl: string;
-  username: string;
-  accessToken: string;
-  expiresAt: string;
+interface PresenceHint {
+  state: PresenceState;
+  lastSeenAt: string | null;
+  ageSeconds: number | null;
 }
 
-const SAVED_LOGIN_KEY = "kakachi.saved-login.v1";
+interface PreferredPeerRecord {
+  username: string;
+  lastConnectedAt: string;
+}
+
+type PreferredPeerMap = Record<string, PreferredPeerRecord>;
+
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const PREFERRED_PEERS_KEY = "kakachi.preferred-peers.v1";
 
 function toFriendlyError(rawMessage: string): string {
   const message = rawMessage.trim();
@@ -70,55 +83,148 @@ function toFriendlyError(rawMessage: string): string {
     return "Could not establish a direct path right now. Kakachi can still try relay mode.";
   }
 
+  if (normalized.includes("keyring") || normalized.includes("secret service")) {
+    return "Secure saved login is unavailable on this device. You can keep using Kakachi without save login.";
+  }
+
   return message || "Something went wrong. Please try again.";
 }
 
-function readSavedLogin(): SavedLogin | null {
+function readPreferredPeers(): PreferredPeerMap {
   if (typeof window === "undefined") {
-    return null;
+    return {};
   }
 
-  const raw = window.localStorage.getItem(SAVED_LOGIN_KEY);
+  const raw = window.localStorage.getItem(PREFERRED_PEERS_KEY);
   if (!raw) {
-    return null;
+    return {};
   }
 
   try {
-    const parsed = JSON.parse(raw) as Partial<SavedLogin>;
-    if (
-      typeof parsed.controlPlaneUrl === "string" &&
-      typeof parsed.username === "string" &&
-      typeof parsed.accessToken === "string" &&
-      typeof parsed.expiresAt === "string"
-    ) {
-      return {
-        controlPlaneUrl: parsed.controlPlaneUrl,
-        username: parsed.username,
-        accessToken: parsed.accessToken,
-        expiresAt: parsed.expiresAt
-      };
+    const parsed = JSON.parse(raw) as Record<string, Partial<PreferredPeerRecord>>;
+    const safe: PreferredPeerMap = {};
+    for (const [networkId, value] of Object.entries(parsed)) {
+      if (
+        typeof value.username === "string" &&
+        value.username.trim().length > 0 &&
+        typeof value.lastConnectedAt === "string"
+      ) {
+        safe[networkId] = {
+          username: value.username,
+          lastConnectedAt: value.lastConnectedAt
+        };
+      }
     }
+
+    return safe;
   } catch {
-    window.localStorage.removeItem(SAVED_LOGIN_KEY);
+    window.localStorage.removeItem(PREFERRED_PEERS_KEY);
+    return {};
   }
-
-  return null;
 }
 
-function writeSavedLogin(payload: SavedLogin) {
+function writePreferredPeers(payload: PreferredPeerMap) {
   if (typeof window === "undefined") {
     return;
   }
 
-  window.localStorage.setItem(SAVED_LOGIN_KEY, JSON.stringify(payload));
+  window.localStorage.setItem(PREFERRED_PEERS_KEY, JSON.stringify(payload));
 }
 
-function clearSavedLogin() {
-  if (typeof window === "undefined") {
-    return;
+function presencePriority(state: PresenceState): number {
+  if (state === "online") {
+    return 0;
+  }
+  if (state === "recent") {
+    return 1;
+  }
+  return 2;
+}
+
+function presenceLabel(state: PresenceState): string {
+  if (state === "online") {
+    return "online";
+  }
+  if (state === "recent") {
+    return "recent";
+  }
+  return "unknown";
+}
+
+function buildPresenceHints(endpointBundles: PeerEndpointBundle[]): Record<string, PresenceHint> {
+  const nowMs = Date.now();
+  const hints: Record<string, PresenceHint> = {};
+
+  for (const bundle of endpointBundles) {
+    let freshestCandidateTs: number | null = null;
+
+    for (const candidate of bundle.candidates) {
+      const timestamp = Date.parse(candidate.observed_at);
+      if (!Number.isFinite(timestamp)) {
+        continue;
+      }
+
+      freshestCandidateTs = freshestCandidateTs === null ? timestamp : Math.max(freshestCandidateTs, timestamp);
+    }
+
+    if (freshestCandidateTs === null) {
+      hints[bundle.username] = {
+        state: "unknown",
+        lastSeenAt: null,
+        ageSeconds: null
+      };
+      continue;
+    }
+
+    const ageSeconds = Math.max(0, Math.floor((nowMs - freshestCandidateTs) / 1000));
+    const state: PresenceState = ageSeconds <= 120 ? "online" : ageSeconds <= 900 ? "recent" : "unknown";
+
+    hints[bundle.username] = {
+      state,
+      lastSeenAt: new Date(freshestCandidateTs).toISOString(),
+      ageSeconds
+    };
   }
 
-  window.localStorage.removeItem(SAVED_LOGIN_KEY);
+  return hints;
+}
+
+function chooseQuickConnectPeer(
+  candidates: PeerIdentity[],
+  requestedPeer: string,
+  preferredPeer: string | null,
+  presenceHints: Record<string, PresenceHint>
+): string {
+  const requested = requestedPeer.trim();
+
+  if (requested && candidates.some((peer) => peer.username === requested)) {
+    return requested;
+  }
+
+  if (preferredPeer && candidates.some((peer) => peer.username === preferredPeer)) {
+    return preferredPeer;
+  }
+
+  const ranked = [...candidates].sort((a, b) => {
+    const hintA = presenceHints[a.username];
+    const hintB = presenceHints[b.username];
+
+    const priorityDelta =
+      presencePriority(hintA?.state ?? "unknown") - presencePriority(hintB?.state ?? "unknown");
+    if (priorityDelta !== 0) {
+      return priorityDelta;
+    }
+
+    const ageA = hintA?.ageSeconds ?? Number.MAX_SAFE_INTEGER;
+    const ageB = hintB?.ageSeconds ?? Number.MAX_SAFE_INTEGER;
+    if (ageA !== ageB) {
+      return ageA - ageB;
+    }
+
+    return a.username.localeCompare(b.username);
+  });
+
+  return ranked[0].username;
 }
 
 export default function App() {
@@ -134,15 +240,17 @@ export default function App() {
   const [loginUsername, setLoginUsername] = useState("");
   const [loginPassword, setLoginPassword] = useState("");
   const [saveLogin, setSaveLogin] = useState(true);
-  const [savedLogin, setSavedLogin] = useState<SavedLogin | null>(null);
+  const [savedLogin, setSavedLogin] = useState<SavedLoginSession | null>(null);
   const [currentUsername, setCurrentUsername] = useState("");
   const [accessToken, setAccessToken] = useState("");
   const [tokenExpiresAt, setTokenExpiresAt] = useState("");
+  const [preferredPeers, setPreferredPeers] = useState<PreferredPeerMap>(() => readPreferredPeers());
 
   const [networkName, setNetworkName] = useState("friends-network");
   const [networkId, setNetworkId] = useState("");
   const [joinNetworkId, setJoinNetworkId] = useState("");
   const [peers, setPeers] = useState<PeerIdentity[]>([]);
+  const [peerPresence, setPeerPresence] = useState<Record<string, PresenceHint>>({});
   const [activeNetwork, setActiveNetwork] = useState<NetworkSummary | null>(null);
 
   const [peerUsername, setPeerUsername] = useState("");
@@ -157,15 +265,33 @@ export default function App() {
   const canUseAuthedActions = accessToken.trim().length > 0 && currentUsername.trim().length > 0;
 
   useEffect(() => {
-    const saved = readSavedLogin();
-    if (!saved) {
-      return;
+    let active = true;
+
+    async function hydrateSavedLogin() {
+      try {
+        const saved = await loadLoginSession();
+        if (!active || !saved) {
+          return;
+        }
+
+        setSavedLogin(saved);
+        setControlPlaneUrl(saved.control_plane_url);
+        setLoginUsername(saved.username);
+        setStatusMessage(`Saved login found for ${saved.username}.`);
+      } catch {
+        if (!active) {
+          return;
+        }
+
+        setStatusMessage("Secure saved login is unavailable. Sign in with username and password.");
+      }
     }
 
-    setSavedLogin(saved);
-    setControlPlaneUrl(saved.controlPlaneUrl);
-    setLoginUsername(saved.username);
-    setStatusMessage(`Saved login found for ${saved.username}.`);
+    void hydrateSavedLogin();
+
+    return () => {
+      active = false;
+    };
   }, []);
 
   const parsedStunServers = useMemo(
@@ -191,14 +317,35 @@ export default function App() {
   }, [runSummary]);
 
   const connectIntentLabel = connectIntent === "lan" ? "LAN party mode" : "Remote VPN mode";
+  const preferredPeer = networkId ? preferredPeers[networkId] : undefined;
 
   function resetNetworkState() {
     setNetworkId("");
     setJoinNetworkId("");
     setPeers([]);
+    setPeerPresence({});
     setPeerUsername("");
     setRunSummary(null);
     setActiveNetwork(null);
+  }
+
+  function rememberPreferredPeer(currentNetworkId: string, username: string) {
+    if (!currentNetworkId || !username) {
+      return;
+    }
+
+    setPreferredPeers((current) => {
+      const next = {
+        ...current,
+        [currentNetworkId]: {
+          username,
+          lastConnectedAt: new Date().toISOString()
+        }
+      };
+
+      writePreferredPeers(next);
+      return next;
+    });
   }
 
   async function runAction<T>(label: string, operation: () => Promise<T>, onSuccess: (value: T) => void) {
@@ -302,23 +449,20 @@ export default function App() {
         setStatusMessage(`Welcome, ${username}.`);
 
         if (saveLogin) {
-          const payload = {
-            controlPlaneUrl,
+          const session: SavedLoginSession = {
+            control_plane_url: controlPlaneUrl,
             username,
-            accessToken: response.access_token,
-            expiresAt: response.expires_at
+            access_token: response.access_token,
+            expires_at: response.expires_at
           };
 
-          setSavedLogin(payload);
-          writeSavedLogin({
-            controlPlaneUrl,
-            username,
-            accessToken: response.access_token,
-            expiresAt: response.expires_at
+          setSavedLogin(session);
+          void saveLoginSession({ session }).catch(() => {
+            setStatusMessage("Signed in, but secure save login is unavailable on this device.");
           });
         } else {
-          clearSavedLogin();
           setSavedLogin(null);
+          void clearLoginSession();
         }
       }
     );
@@ -329,18 +473,18 @@ export default function App() {
       return;
     }
 
-    const expiresAtMs = Date.parse(savedLogin.expiresAt);
+    const expiresAtMs = Date.parse(savedLogin.expires_at);
     if (Number.isFinite(expiresAtMs) && expiresAtMs < Date.now()) {
-      clearSavedLogin();
+      void clearLoginSession();
       setSavedLogin(null);
       setError("Saved login expired. Sign in with password again.");
       return;
     }
 
     setCurrentUsername(savedLogin.username);
-    setAccessToken(savedLogin.accessToken);
-    setTokenExpiresAt(savedLogin.expiresAt);
-    setControlPlaneUrl(savedLogin.controlPlaneUrl);
+    setAccessToken(savedLogin.access_token);
+    setTokenExpiresAt(savedLogin.expires_at);
+    setControlPlaneUrl(savedLogin.control_plane_url);
     setError(null);
     setStatusMessage(`Welcome back, ${savedLogin.username}.`);
   }
@@ -353,7 +497,7 @@ export default function App() {
     setError(null);
     setStatusMessage("Signed out.");
     resetNetworkState();
-    clearSavedLogin();
+    void clearLoginSession();
     setSavedLogin(null);
   }
 
@@ -397,6 +541,7 @@ export default function App() {
         setActiveNetwork(response);
         setNetworkId(response.network_id);
         setJoinNetworkId(response.network_id);
+        setPeerPresence({});
         setStatusMessage(`Network ${response.name} is ready.`);
       }
     );
@@ -423,6 +568,7 @@ export default function App() {
       (response) => {
         setActiveNetwork(response);
         setNetworkId(response.network_id);
+        setPeerPresence({});
         setStatusMessage(`Joined network ${response.name}.`);
       }
     );
@@ -437,18 +583,44 @@ export default function App() {
 
     await runAction(
       "Refresh peers",
-      () =>
-        listPeers({
+      async () => {
+        const peerList = await listPeers({
           control_plane_url: controlPlaneUrl,
           access_token: accessToken,
           network_id: networkId
-        }),
-      (response) => {
-        setPeers(response);
-        if (response.length === 0) {
+        });
+
+        let endpointBundles: PeerEndpointBundle[] = [];
+        try {
+          endpointBundles = await listPeerEndpointBundles({
+            control_plane_url: controlPlaneUrl,
+            access_token: accessToken,
+            network_id: networkId
+          });
+        } catch {
+          endpointBundles = [];
+        }
+
+        return {
+          peerList,
+          presenceHints: buildPresenceHints(endpointBundles)
+        };
+      },
+      ({ peerList, presenceHints }) => {
+        setPeers(peerList);
+        setPeerPresence(presenceHints);
+
+        const otherPeers = peerList.filter((peer) => peer.username !== currentUsername);
+        const onlineCount = otherPeers.filter(
+          (peer) => (presenceHints[peer.username]?.state ?? "unknown") === "online"
+        ).length;
+
+        if (otherPeers.length === 0) {
           setStatusMessage("No peers in this network yet.");
+        } else if (onlineCount > 0) {
+          setStatusMessage(`Found ${otherPeers.length} peer(s). ${onlineCount} online now.`);
         } else {
-          setStatusMessage(`Found ${response.length} peer(s) in your network.`);
+          setStatusMessage(`Found ${otherPeers.length} peer(s). None marked online yet.`);
         }
       }
     );
@@ -469,18 +641,32 @@ export default function App() {
     await runAction(
       "Quick connect",
       async () => {
-        const peerList = await listPeers({
-          control_plane_url: controlPlaneUrl,
-          access_token: accessToken,
-          network_id: networkId
-        });
+        const [peerList, endpointBundles] = await Promise.all([
+          listPeers({
+            control_plane_url: controlPlaneUrl,
+            access_token: accessToken,
+            network_id: networkId
+          }),
+          listPeerEndpointBundles({
+            control_plane_url: controlPlaneUrl,
+            access_token: accessToken,
+            network_id: networkId
+          }).catch(() => [])
+        ]);
 
         const candidates = peerList.filter((peer) => peer.username !== currentUsername);
         if (candidates.length === 0) {
           throw new Error("NO_PEERS_AVAILABLE");
         }
 
-        const selectedPeer = peerUsername.trim() || candidates[0].username;
+        const presenceHints = buildPresenceHints(endpointBundles);
+        const selectedPeer = chooseQuickConnectPeer(
+          candidates,
+          peerUsername,
+          preferredPeers[networkId]?.username ?? null,
+          presenceHints
+        );
+
         const summary = await runSessionProbe({
           control_plane_url: controlPlaneUrl,
           access_token: accessToken,
@@ -491,12 +677,19 @@ export default function App() {
           session_id: runSummary?.session_id
         });
 
-        return { selectedPeer, summary, peerList };
+        return {
+          selectedPeer,
+          summary,
+          peerList,
+          presenceHints
+        };
       },
-      ({ selectedPeer, summary, peerList }) => {
+      ({ selectedPeer, summary, peerList, presenceHints }) => {
         setPeers(peerList);
+        setPeerPresence(presenceHints);
         setPeerUsername(selectedPeer);
         setRunSummary(summary);
+        rememberPreferredPeer(networkId, selectedPeer);
         const pathLabel = summary.final_path === "direct" ? "direct LAN tunnel" : "relay tunnel";
         const usage = connectIntent === "lan" ? "LAN apps" : "VPN traffic";
         setStatusMessage(`Connected to ${selectedPeer} for ${usage} using ${pathLabel}.`);
@@ -536,6 +729,7 @@ export default function App() {
         }),
       (response) => {
         setRunSummary(response);
+        rememberPreferredPeer(networkId, trimmedPeer);
         const pathLabel = response.final_path === "direct" ? "direct LAN tunnel" : "relay tunnel";
         const usage = connectIntent === "lan" ? "LAN apps" : "VPN traffic";
         setStatusMessage(`Connected to ${trimmedPeer} for ${usage} using ${pathLabel}.`);
@@ -726,7 +920,14 @@ export default function App() {
               <button className="quick-connect" disabled={!!busy} onClick={onQuickConnect}>
                 {busy === "Quick connect" ? "Connecting..." : "Quick connect"}
               </button>
-              <p className="inline-info">This automatically finds online friends and connects with safest path.</p>
+              <p className="inline-info">
+                This picks the typed friend, then your preferred friend, then the best online candidate.
+              </p>
+              {preferredPeer ? (
+                <p className="inline-info">
+                  Preferred friend for this network: {preferredPeer.username}.
+                </p>
+              ) : null}
 
               <p className={`connection-pill ${runSummary?.final_path ?? "idle"}`}>{connectionLabel}</p>
               {runSummary ? <p className="inline-info">Reason: {runSummary.final_reason}</p> : null}
@@ -751,15 +952,20 @@ export default function App() {
                   {visiblePeers.length === 0 ? (
                     <p className="inline-info">No peers available yet.</p>
                   ) : (
-                    visiblePeers.map((peer) => (
-                      <button
-                        key={peer.username}
-                        className="peer-item"
-                        onClick={() => setPeerUsername(peer.username)}
-                      >
-                        {peer.username}
-                      </button>
-                    ))
+                    visiblePeers.map((peer) => {
+                        const hint = peerPresence[peer.username];
+                        const status = hint?.state ?? "unknown";
+                        return (
+                          <button
+                            key={peer.username}
+                            className="peer-item"
+                            onClick={() => setPeerUsername(peer.username)}
+                          >
+                            <span>{peer.username}</span>
+                            <span className={`peer-presence ${status}`}>{presenceLabel(status)}</span>
+                          </button>
+                        );
+                    })
                   )}
                 </div>
               </details>

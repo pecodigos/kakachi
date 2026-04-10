@@ -304,6 +304,10 @@ button:disabled {
 }
 
 .peer-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.55rem;
   background: #f1f6fb;
   color: #24465f;
   border: 1px solid #c5d6e3;
@@ -312,6 +316,26 @@ button:disabled {
 
 .peer-item:hover {
   background: #e6f0f8;
+}
+
+.peer-presence {
+  border-radius: 999px;
+  padding: 0.12rem 0.5rem;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  background: #dce7f0;
+  color: #35566f;
+}
+
+.peer-presence.online {
+  background: #d8f1e4;
+  color: #0f6b4a;
+}
+
+.peer-presence.recent {
+  background: #e7eef8;
+  color: #1d4d73;
 }
 
 details {

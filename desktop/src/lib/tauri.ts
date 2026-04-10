@@ -26,6 +26,24 @@ export interface PeerIdentity {
   public_key: string;
 }
 
+export interface EndpointCandidate {
+  endpoint: string;
+  observed_at: string;
+}
+
+export interface PeerEndpointBundle {
+  username: string;
+  public_key: string;
+  candidates: EndpointCandidate[];
+}
+
+export interface SavedLoginSession {
+  control_plane_url: string;
+  username: string;
+  access_token: string;
+  expires_at: string;
+}
+
 export interface NetworkSummary {
   network_id: string;
   name: string;
@@ -161,6 +179,28 @@ export function listPeers(input: {
   network_id: string;
 }): Promise<PeerIdentity[]> {
   return invokeTyped("list_peers", { input });
+}
+
+export function listPeerEndpointBundles(input: {
+  control_plane_url: string;
+  access_token: string;
+  network_id: string;
+}): Promise<PeerEndpointBundle[]> {
+  return invokeTyped("list_peer_endpoint_bundles", { input });
+}
+
+export function saveLoginSession(input: {
+  session: SavedLoginSession;
+}): Promise<void> {
+  return invokeTyped("save_login_session", { input });
+}
+
+export function loadLoginSession(): Promise<SavedLoginSession | null> {
+  return invokeTyped("load_login_session");
+}
+
+export function clearLoginSession(): Promise<void> {
+  return invokeTyped("clear_login_session");
 }
 
 export function openSession(input: {
