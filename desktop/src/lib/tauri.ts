@@ -44,6 +44,11 @@ export interface SavedLoginSession {
   expires_at: string;
 }
 
+export interface LocalAddressSummary {
+  ipv4: string[];
+  ipv6: string[];
+}
+
 export interface NetworkSummary {
   network_id: string;
   name: string;
@@ -201,6 +206,10 @@ export function loadLoginSession(): Promise<SavedLoginSession | null> {
 
 export function clearLoginSession(): Promise<void> {
   return invokeTyped("clear_login_session");
+}
+
+export function getLocalAddresses(): Promise<LocalAddressSummary> {
+  return invokeTyped("get_local_addresses");
 }
 
 export function openSession(input: {

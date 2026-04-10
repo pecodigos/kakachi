@@ -3,15 +3,15 @@ import {
   clearLoginSession,
   createNetwork,
   generateWireguardIdentity,
-  listPeerEndpointBundles,
+  getLocalAddresses,
   joinNetwork,
-  loadLoginSession,
+  listPeerEndpointBundles,
   listPeers,
+  loadLoginSession,
   loginUser,
   registerUser,
-  runSessionProbe,
   saveLoginSession,
-  type NegotiationRunSummary,
+  type LocalAddressSummary,
   type NetworkSummary,
   type PeerEndpointBundle,
   type PeerIdentity,
@@ -19,33 +19,18 @@ import {
 } from "./lib/tauri";
 
 type AuthView = "login" | "register";
-type PresenceState = "online" | "recent" | "unknown";
 type SecureStorageState = "unknown" | "available" | "unavailable";
-type QuickConnectSelectionSource = "typed" | "preferred" | "ranked";
 
-interface PresenceHint {
-  state: PresenceState;
+interface PeerPresence {
+  online: boolean;
   lastSeenAt: string | null;
-  ageSeconds: number | null;
 }
-
-interface PreferredPeerRecord {
-  username: string;
-  lastConnectedAt: string;
-}
-
-type PreferredPeerMap = Record<string, PreferredPeerRecord>;
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const PREFERRED_PEERS_KEY = "kakachi.preferred-peers.v1";
 
 function toFriendlyError(rawMessage: string): string {
   const message = rawMessage.trim();
   const normalized = message.toLowerCase();
-
-  if (normalized.includes("no_peers_available")) {
-    return "No friends are online in this network yet. Ask them to join and try again.";
-  }
 
   if (
     normalized.includes("401") ||
@@ -60,210 +45,85 @@ function toFriendlyError(rawMessage: string): string {
     return "That invite code is not valid. Check the network ID and try again.";
   }
 
-  if (normalized.includes("control_plane_url") || normalized.includes("http/https/ws/wss")) {
-    return "The server address looks invalid. Use something like http://127.0.0.1:8080.";
-  }
-
   if (
     normalized.includes("connection refused") ||
     normalized.includes("dns") ||
     normalized.includes("timed out") ||
     normalized.includes("failed to send request")
   ) {
-    return "Kakachi could not reach the server. Check if backend is running and your address is correct.";
-  }
-
-  if (normalized.includes("already exists") || normalized.includes("duplicate")) {
-    return "This username is already taken. Choose another username.";
-  }
-
-  if (normalized.includes("peer") && normalized.includes("not")) {
-    return "Could not find this friend in your network. Refresh peers and try again.";
-  }
-
-  if (normalized.includes("stun")) {
-    return "Could not establish a direct path right now. Kakachi can still try relay mode.";
+    return "Kakachi could not reach the server. Check if backend is running.";
   }
 
   if (normalized.includes("keyring") || normalized.includes("secret service")) {
-    return "Secure saved login is unavailable on this device. You can keep using Kakachi without save login.";
+    return "Secure saved login is unavailable on this device. You can still use normal sign in.";
   }
 
   return message || "Something went wrong. Please try again.";
 }
 
-function readPreferredPeers(): PreferredPeerMap {
-  if (typeof window === "undefined") {
-    return {};
-  }
-
-  const raw = window.localStorage.getItem(PREFERRED_PEERS_KEY);
-  if (!raw) {
-    return {};
-  }
-
-  try {
-    const parsed = JSON.parse(raw) as Record<string, Partial<PreferredPeerRecord>>;
-    const safe: PreferredPeerMap = {};
-    for (const [networkId, value] of Object.entries(parsed)) {
-      if (
-        typeof value.username === "string" &&
-        value.username.trim().length > 0 &&
-        typeof value.lastConnectedAt === "string"
-      ) {
-        safe[networkId] = {
-          username: value.username,
-          lastConnectedAt: value.lastConnectedAt
-        };
-      }
-    }
-
-    return safe;
-  } catch {
-    window.localStorage.removeItem(PREFERRED_PEERS_KEY);
-    return {};
-  }
-}
-
-function writePreferredPeers(payload: PreferredPeerMap) {
-  if (typeof window === "undefined") {
-    return;
-  }
-
-  window.localStorage.setItem(PREFERRED_PEERS_KEY, JSON.stringify(payload));
-}
-
-function presencePriority(state: PresenceState): number {
-  if (state === "online") {
-    return 0;
-  }
-  if (state === "recent") {
-    return 1;
-  }
-  return 2;
-}
-
-function presenceLabel(state: PresenceState): string {
-  if (state === "online") {
-    return "online";
-  }
-  if (state === "recent") {
-    return "recent";
-  }
-  return "unknown";
-}
-
-function presenceTimeLabel(hint: PresenceHint | undefined): string {
-  if (!hint) {
-    return "status unavailable";
-  }
-
-  if (hint.state === "online") {
-    return "active now";
-  }
-
-  if (hint.ageSeconds === null) {
-    return "last seen unknown";
-  }
-
-  if (hint.ageSeconds < 60) {
-    return `${hint.ageSeconds}s ago`;
-  }
-
-  const minutes = Math.floor(hint.ageSeconds / 60);
-  if (minutes < 60) {
-    return `${minutes}m ago`;
-  }
-
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) {
-    return `${hours}h ago`;
-  }
-
-  const days = Math.floor(hours / 24);
-  return `${days}d ago`;
-}
-
-function buildPresenceHints(endpointBundles: PeerEndpointBundle[]): Record<string, PresenceHint> {
+function buildPresenceMap(endpointBundles: PeerEndpointBundle[]): Record<string, PeerPresence> {
   const nowMs = Date.now();
-  const hints: Record<string, PresenceHint> = {};
+  const map: Record<string, PeerPresence> = {};
 
   for (const bundle of endpointBundles) {
-    let freshestCandidateTs: number | null = null;
+    let freshestAtMs: number | null = null;
 
     for (const candidate of bundle.candidates) {
-      const timestamp = Date.parse(candidate.observed_at);
-      if (!Number.isFinite(timestamp)) {
+      const parsed = Date.parse(candidate.observed_at);
+      if (!Number.isFinite(parsed)) {
         continue;
       }
 
-      freshestCandidateTs = freshestCandidateTs === null ? timestamp : Math.max(freshestCandidateTs, timestamp);
+      freshestAtMs = freshestAtMs === null ? parsed : Math.max(freshestAtMs, parsed);
     }
 
-    if (freshestCandidateTs === null) {
-      hints[bundle.username] = {
-        state: "unknown",
-        lastSeenAt: null,
-        ageSeconds: null
-      };
+    if (freshestAtMs === null) {
+      map[bundle.username] = { online: false, lastSeenAt: null };
       continue;
     }
 
-    const ageSeconds = Math.max(0, Math.floor((nowMs - freshestCandidateTs) / 1000));
-    const state: PresenceState = ageSeconds <= 120 ? "online" : ageSeconds <= 900 ? "recent" : "unknown";
-
-    hints[bundle.username] = {
-      state,
-      lastSeenAt: new Date(freshestCandidateTs).toISOString(),
-      ageSeconds
+    const ageSeconds = Math.max(0, Math.floor((nowMs - freshestAtMs) / 1000));
+    map[bundle.username] = {
+      online: ageSeconds <= 120,
+      lastSeenAt: new Date(freshestAtMs).toISOString()
     };
   }
 
-  return hints;
+  return map;
 }
 
-function chooseQuickConnectPeer(
-  candidates: PeerIdentity[],
-  requestedPeer: string,
-  preferredPeer: string | null,
-  presenceHints: Record<string, PresenceHint>
-): { username: string; source: QuickConnectSelectionSource } {
-  const requested = requestedPeer.trim();
-
-  if (requested && candidates.some((peer) => peer.username === requested)) {
-    return { username: requested, source: "typed" };
+function formatLastSeen(lastSeenAt: string | null): string {
+  if (!lastSeenAt) {
+    return "No recent signal";
   }
 
-  if (preferredPeer && candidates.some((peer) => peer.username === preferredPeer)) {
-    return {
-      username: preferredPeer,
-      source: "preferred"
-    };
+  const lastSeenMs = Date.parse(lastSeenAt);
+  if (!Number.isFinite(lastSeenMs)) {
+    return "No recent signal";
   }
 
-  const ranked = [...candidates].sort((a, b) => {
-    const hintA = presenceHints[a.username];
-    const hintB = presenceHints[b.username];
+  const ageSeconds = Math.max(0, Math.floor((Date.now() - lastSeenMs) / 1000));
+  if (ageSeconds < 60) {
+    return `${ageSeconds}s ago`;
+  }
 
-    const priorityDelta =
-      presencePriority(hintA?.state ?? "unknown") - presencePriority(hintB?.state ?? "unknown");
-    if (priorityDelta !== 0) {
-      return priorityDelta;
-    }
+  const ageMinutes = Math.floor(ageSeconds / 60);
+  if (ageMinutes < 60) {
+    return `${ageMinutes}m ago`;
+  }
 
-    const ageA = hintA?.ageSeconds ?? Number.MAX_SAFE_INTEGER;
-    const ageB = hintB?.ageSeconds ?? Number.MAX_SAFE_INTEGER;
-    if (ageA !== ageB) {
-      return ageA - ageB;
-    }
+  const ageHours = Math.floor(ageMinutes / 60);
+  if (ageHours < 24) {
+    return `${ageHours}h ago`;
+  }
 
-    return a.username.localeCompare(b.username);
-  });
+  const ageDays = Math.floor(ageHours / 24);
+  return `${ageDays}d ago`;
+}
 
-  return {
-    username: ranked[0].username,
-    source: "ranked"
-  };
+function upsertServerList(current: NetworkSummary[], summary: NetworkSummary): NetworkSummary[] {
+  const existing = current.filter((item) => item.network_id !== summary.network_id);
+  return [summary, ...existing];
 }
 
 export default function App() {
@@ -280,162 +140,73 @@ export default function App() {
   const [loginPassword, setLoginPassword] = useState("");
   const [saveLogin, setSaveLogin] = useState(true);
   const [savedLogin, setSavedLogin] = useState<SavedLoginSession | null>(null);
+
   const [currentUsername, setCurrentUsername] = useState("");
   const [accessToken, setAccessToken] = useState("");
-  const [tokenExpiresAt, setTokenExpiresAt] = useState("");
-  const [preferredPeers, setPreferredPeers] = useState<PreferredPeerMap>(() => readPreferredPeers());
+  const [secureStorageState, setSecureStorageState] = useState<SecureStorageState>("unknown");
+
+  const [isPowerOn, setIsPowerOn] = useState(true);
+  const [localAddresses, setLocalAddresses] = useState<LocalAddressSummary>({ ipv4: [], ipv6: [] });
 
   const [networkName, setNetworkName] = useState("friends-network");
-  const [networkId, setNetworkId] = useState("");
   const [joinNetworkId, setJoinNetworkId] = useState("");
   const [serverList, setServerList] = useState<NetworkSummary[]>([]);
-  const [peers, setPeers] = useState<PeerIdentity[]>([]);
-  const [peerPresence, setPeerPresence] = useState<Record<string, PresenceHint>>({});
-  const [activeNetwork, setActiveNetwork] = useState<NetworkSummary | null>(null);
+  const [activeServerId, setActiveServerId] = useState("");
 
-  const [peerUsername, setPeerUsername] = useState("");
-  const [connectIntent, setConnectIntent] = useState<"lan" | "vpn">("lan");
-  const [stunServersCsv, setStunServersCsv] = useState("74.125.250.129:19302");
-  const [localBindAddr, setLocalBindAddr] = useState("0.0.0.0:7001");
-  const [runSummary, setRunSummary] = useState<NegotiationRunSummary | null>(null);
+  const [peers, setPeers] = useState<PeerIdentity[]>([]);
+  const [peerPresence, setPeerPresence] = useState<Record<string, PeerPresence>>({});
 
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [secureStorageState, setSecureStorageState] = useState<SecureStorageState>("unknown");
-  const [isPowerOn, setIsPowerOn] = useState(true);
 
-  const canUseAuthedActions = accessToken.trim().length > 0 && currentUsername.trim().length > 0;
+  const isAuthenticated = accessToken.trim().length > 0 && currentUsername.trim().length > 0;
+
+  const activeServer = useMemo(
+    () => serverList.find((server) => server.network_id === activeServerId) ?? null,
+    [serverList, activeServerId]
+  );
+
+  const displayedMembers = useMemo(() => {
+    if (!activeServer) {
+      return [] as PeerIdentity[];
+    }
+
+    if (peers.length > 0) {
+      return peers;
+    }
+
+    return activeServer.members;
+  }, [activeServer, peers]);
 
   useEffect(() => {
     let active = true;
 
-    async function hydrateSavedLogin() {
+    async function hydrateSavedSession() {
       try {
-        const saved = await loadLoginSession();
-        if (!active || !saved) {
+        const session = await loadLoginSession();
+        if (!active || !session) {
           return;
         }
 
-        setSavedLogin(saved);
-        setControlPlaneUrl(saved.control_plane_url);
-        setLoginUsername(saved.username);
+        setSavedLogin(session);
+        setLoginUsername(session.username);
+        setControlPlaneUrl(session.control_plane_url);
         setSecureStorageState("available");
-        setStatusMessage(`Saved login found for ${saved.username}.`);
       } catch {
         if (!active) {
           return;
         }
 
         setSecureStorageState("unavailable");
-        setStatusMessage("Secure saved login is unavailable. Sign in with username and password.");
       }
     }
 
-    void hydrateSavedLogin();
+    void hydrateSavedSession();
 
     return () => {
       active = false;
     };
   }, []);
-
-  const parsedStunServers = useMemo(
-    () =>
-      stunServersCsv
-        .split(",")
-        .map((item) => item.trim())
-        .filter((item) => item.length > 0),
-    [stunServersCsv]
-  );
-
-  const visiblePeers = useMemo(
-    () => peers.filter((peer) => peer.username !== currentUsername),
-    [peers, currentUsername]
-  );
-
-  const connectionLabel = useMemo(() => {
-    if (!runSummary) {
-      return "Not connected yet";
-    }
-
-    return runSummary.final_path === "direct" ? "Direct LAN tunnel ready" : "Connected through relay";
-  }, [runSummary]);
-
-  const connectIntentLabel = connectIntent === "lan" ? "LAN party mode" : "Remote VPN mode";
-  const preferredPeer = networkId ? preferredPeers[networkId] : undefined;
-  const activeServer =
-    (networkId ? serverList.find((server) => server.network_id === networkId) : undefined) ?? activeNetwork;
-
-  function resetNetworkState() {
-    setNetworkId("");
-    setJoinNetworkId("");
-    setPeers([]);
-    setPeerPresence({});
-    setPeerUsername("");
-    setRunSummary(null);
-    setActiveNetwork(null);
-  }
-
-  function upsertServer(summary: NetworkSummary) {
-    setServerList((current) => {
-      const existing = current.filter((item) => item.network_id !== summary.network_id);
-      return [summary, ...existing];
-    });
-  }
-
-  function requirePowerOn(): boolean {
-    if (!isPowerOn) {
-      setError("Turn on power to manage or connect servers.");
-      return false;
-    }
-
-    return true;
-  }
-
-  function onTogglePower() {
-    const nextPowerState = !isPowerOn;
-    setIsPowerOn(nextPowerState);
-    setError(null);
-
-    if (!nextPowerState) {
-      setRunSummary(null);
-      setStatusMessage("Power off. Server sessions are paused.");
-      return;
-    }
-
-    setStatusMessage("Power on. Ready to connect.");
-  }
-
-  function onSelectServer(server: NetworkSummary) {
-    setActiveNetwork(server);
-    setNetworkId(server.network_id);
-    setJoinNetworkId(server.network_id);
-    setPeerUsername("");
-    setRunSummary(null);
-    setStatusMessage(`Selected server ${server.name}.`);
-
-    if (isPowerOn) {
-      void onRefreshPeers(server.network_id);
-    }
-  }
-
-  function rememberPreferredPeer(currentNetworkId: string, username: string) {
-    if (!currentNetworkId || !username) {
-      return;
-    }
-
-    setPreferredPeers((current) => {
-      const next = {
-        ...current,
-        [currentNetworkId]: {
-          username,
-          lastConnectedAt: new Date().toISOString()
-        }
-      };
-
-      writePreferredPeers(next);
-      return next;
-    });
-  }
 
   async function runAction<T>(label: string, operation: () => Promise<T>, onSuccess: (value: T) => void) {
     setBusy(label);
@@ -445,26 +216,180 @@ export default function App() {
       const value = await operation();
       onSuccess(value);
     } catch (err) {
-      const technicalMessage = err instanceof Error ? err.message : "Unexpected error";
-      if (technicalMessage === "USER_CANCELLED") {
-        setStatusMessage(`${label} canceled.`);
-        return;
-      }
-
-      const friendlyMessage = toFriendlyError(technicalMessage);
-      setError(friendlyMessage);
-      setStatusMessage(`${label} failed. ${friendlyMessage}`);
+      const raw = err instanceof Error ? err.message : "Unexpected error";
+      const friendly = toFriendlyError(raw);
+      setError(friendly);
+      setStatusMessage(`${label} failed. ${friendly}`);
     } finally {
       setBusy(null);
     }
   }
 
   function requireAuth(): boolean {
-    if (!canUseAuthedActions) {
-      setError("Login first to run authenticated actions.");
+    if (!isAuthenticated) {
+      setError("Sign in first.");
       return false;
     }
+
     return true;
+  }
+
+  function requirePowerOn(): boolean {
+    if (!isPowerOn) {
+      setError("Turn power on first.");
+      return false;
+    }
+
+    return true;
+  }
+
+  async function refreshLocalAddresses() {
+    try {
+      const summary = await getLocalAddresses();
+      setLocalAddresses(summary);
+    } catch {
+      setLocalAddresses({ ipv4: [], ipv6: [] });
+    }
+  }
+
+  async function refreshMembers(networkId: string) {
+    if (!isAuthenticated || !networkId) {
+      return;
+    }
+
+    const [peerList, endpointBundles] = await Promise.all([
+      listPeers({
+        control_plane_url: controlPlaneUrl,
+        access_token: accessToken,
+        network_id: networkId
+      }),
+      listPeerEndpointBundles({
+        control_plane_url: controlPlaneUrl,
+        access_token: accessToken,
+        network_id: networkId
+      }).catch(() => [])
+    ]);
+
+    const nextPresence = buildPresenceMap(endpointBundles);
+    nextPresence[currentUsername] = {
+      online: isPowerOn,
+      lastSeenAt: nextPresence[currentUsername]?.lastSeenAt ?? null
+    };
+
+    setPeers(peerList);
+    setPeerPresence(nextPresence);
+    setServerList((current) =>
+      current.map((server) =>
+        server.network_id === networkId
+          ? {
+              ...server,
+              members: peerList
+            }
+          : server
+      )
+    );
+  }
+
+  function onTogglePower() {
+    const nextState = !isPowerOn;
+    setIsPowerOn(nextState);
+
+    if (!nextState) {
+      setStatusMessage("Power off. Presence updates paused.");
+      setPeers([]);
+      setPeerPresence({});
+      return;
+    }
+
+    setStatusMessage("Power on.");
+    void refreshLocalAddresses();
+    if (activeServerId) {
+      void refreshMembers(activeServerId);
+    }
+  }
+
+  function onSelectServer(server: NetworkSummary) {
+    setActiveServerId(server.network_id);
+    setPeers([]);
+    setPeerPresence({});
+    setStatusMessage(`Selected server ${server.name}.`);
+
+    if (isPowerOn) {
+      void refreshMembers(server.network_id);
+    }
+  }
+
+  async function onCreateNetwork(event: FormEvent) {
+    event.preventDefault();
+    if (!requireAuth() || !requirePowerOn()) return;
+
+    const trimmedName = networkName.trim();
+    if (!trimmedName) {
+      setError("Network name is required.");
+      return;
+    }
+
+    await runAction(
+      "Create network",
+      () =>
+        createNetwork({
+          control_plane_url: controlPlaneUrl,
+          access_token: accessToken,
+          name: trimmedName
+        }),
+      (summary) => {
+        setServerList((current) => upsertServerList(current, summary));
+        setActiveServerId(summary.network_id);
+        setJoinNetworkId(summary.network_id);
+        setStatusMessage(`Server ${summary.name} created.`);
+        void refreshMembers(summary.network_id);
+      }
+    );
+  }
+
+  async function onJoinNetwork(event: FormEvent) {
+    event.preventDefault();
+    if (!requireAuth() || !requirePowerOn()) return;
+
+    const trimmedNetworkId = joinNetworkId.trim();
+    if (!trimmedNetworkId) {
+      setError("Network ID is required.");
+      return;
+    }
+
+    await runAction(
+      "Join network",
+      () =>
+        joinNetwork({
+          control_plane_url: controlPlaneUrl,
+          access_token: accessToken,
+          network_id: trimmedNetworkId
+        }),
+      (summary) => {
+        setServerList((current) => upsertServerList(current, summary));
+        setActiveServerId(summary.network_id);
+        setStatusMessage(`Joined server ${summary.name}.`);
+        void refreshMembers(summary.network_id);
+      }
+    );
+  }
+
+  async function onRefreshActiveServerMembers() {
+    if (!requireAuth() || !requirePowerOn()) return;
+    if (!activeServerId) {
+      setError("Select a server first.");
+      return;
+    }
+
+    await runAction(
+      "Refresh members",
+      async () => {
+        await refreshMembers(activeServerId);
+      },
+      () => {
+        setStatusMessage("Member list refreshed.");
+      }
+    );
   }
 
   async function onRegister(event: FormEvent) {
@@ -496,14 +421,14 @@ export default function App() {
     await runAction(
       "Create account",
       async () => {
-        const identity = await generateWireguardIdentity();
+        const keyPair = await generateWireguardIdentity();
 
         return registerUser({
           control_plane_url: controlPlaneUrl,
           username,
           email,
           password: registerPassword,
-          public_key: identity.public_key
+          public_key: keyPair.public_key
         });
       },
       (response) => {
@@ -513,7 +438,7 @@ export default function App() {
         setRegisterEmail("");
         setRegisterPassword("");
         setRegisterConfirmPassword("");
-        setStatusMessage("Account created. Sign in to continue.");
+        setStatusMessage("Account created.");
       }
     );
   }
@@ -537,10 +462,14 @@ export default function App() {
         }),
       (response) => {
         setAccessToken(response.access_token);
-        setTokenExpiresAt(response.expires_at);
         setCurrentUsername(username);
         setLoginPassword("");
         setStatusMessage("");
+        setIsPowerOn(true);
+        setPeers([]);
+        setPeerPresence({});
+        setServerList([]);
+        setActiveServerId("");
 
         if (saveLogin) {
           const session: SavedLoginSession = {
@@ -551,15 +480,16 @@ export default function App() {
           };
 
           setSavedLogin(session);
+          setSecureStorageState("available");
           void saveLoginSession({ session }).catch(() => {
             setSecureStorageState("unavailable");
-            setStatusMessage("Signed in, but secure save login is unavailable on this device.");
           });
-          setSecureStorageState("available");
         } else {
           setSavedLogin(null);
           void clearLoginSession();
         }
+
+        void refreshLocalAddresses();
       }
     );
   }
@@ -573,289 +503,40 @@ export default function App() {
     if (Number.isFinite(expiresAtMs) && expiresAtMs < Date.now()) {
       void clearLoginSession();
       setSavedLogin(null);
-      setError("Saved login expired. Sign in with password again.");
+      setError("Saved login expired. Sign in again.");
       return;
     }
 
     setCurrentUsername(savedLogin.username);
     setAccessToken(savedLogin.access_token);
-    setTokenExpiresAt(savedLogin.expires_at);
     setControlPlaneUrl(savedLogin.control_plane_url);
-    setError(null);
     setStatusMessage("");
+    setError(null);
+    setIsPowerOn(true);
+    setPeers([]);
+    setPeerPresence({});
+    setServerList([]);
+    setActiveServerId("");
+    void refreshLocalAddresses();
   }
 
   function onLogout() {
     setAccessToken("");
-    setTokenExpiresAt("");
     setCurrentUsername("");
     setLoginPassword("");
-    setServerList([]);
-    setIsPowerOn(true);
     setError(null);
     setStatusMessage("Signed out.");
-    resetNetworkState();
+    setIsPowerOn(true);
+    setLocalAddresses({ ipv4: [], ipv6: [] });
+    setPeers([]);
+    setPeerPresence({});
+    setServerList([]);
+    setActiveServerId("");
     void clearLoginSession();
     setSavedLogin(null);
   }
 
-  async function onCopyNetworkId() {
-    if (!networkId) {
-      return;
-    }
-
-    try {
-      await navigator.clipboard.writeText(networkId);
-      setStatusMessage("Network ID copied. Share it with your friend.");
-    } catch {
-      setError("Could not copy network ID. Copy it manually.");
-    }
-  }
-
-  function onChangeNetwork() {
-    resetNetworkState();
-    setStatusMessage("Choose or create a network.");
-  }
-
-  async function onCreateNetwork(event: FormEvent) {
-    event.preventDefault();
-    if (!requireAuth()) return;
-    if (!requirePowerOn()) return;
-
-    const trimmedName = networkName.trim();
-    if (!trimmedName) {
-      setError("Network name is required.");
-      return;
-    }
-
-    await runAction(
-      "Create network",
-      () =>
-        createNetwork({
-          control_plane_url: controlPlaneUrl,
-          access_token: accessToken,
-          name: trimmedName
-        }),
-      (response) => {
-        upsertServer(response);
-        setActiveNetwork(response);
-        setNetworkId(response.network_id);
-        setJoinNetworkId(response.network_id);
-        setPeerPresence({});
-        setStatusMessage(`Network ${response.name} is ready.`);
-      }
-    );
-  }
-
-  async function onJoinNetwork(event: FormEvent) {
-    event.preventDefault();
-    if (!requireAuth()) return;
-    if (!requirePowerOn()) return;
-
-    const trimmedNetworkId = joinNetworkId.trim();
-    if (!trimmedNetworkId) {
-      setError("Network ID is required.");
-      return;
-    }
-
-    await runAction(
-      "Join network",
-      () =>
-        joinNetwork({
-          control_plane_url: controlPlaneUrl,
-          access_token: accessToken,
-          network_id: trimmedNetworkId
-        }),
-      (response) => {
-        upsertServer(response);
-        setActiveNetwork(response);
-        setNetworkId(response.network_id);
-        setPeerPresence({});
-        setStatusMessage(`Joined network ${response.name}.`);
-      }
-    );
-  }
-
-  async function onRefreshPeers(targetNetworkId?: string) {
-    if (!requireAuth()) return;
-    if (!requirePowerOn()) return;
-    const selectedNetworkId = targetNetworkId ?? networkId;
-    if (!selectedNetworkId) {
-      setError("Create or join a network first.");
-      return;
-    }
-
-    await runAction(
-      "Refresh peers",
-      async () => {
-        const peerList = await listPeers({
-          control_plane_url: controlPlaneUrl,
-          access_token: accessToken,
-          network_id: selectedNetworkId
-        });
-
-        let endpointBundles: PeerEndpointBundle[] = [];
-        try {
-          endpointBundles = await listPeerEndpointBundles({
-            control_plane_url: controlPlaneUrl,
-            access_token: accessToken,
-            network_id: selectedNetworkId
-          });
-        } catch {
-          endpointBundles = [];
-        }
-
-        return {
-          peerList,
-          presenceHints: buildPresenceHints(endpointBundles)
-        };
-      },
-      ({ peerList, presenceHints }) => {
-        setPeers(peerList);
-        setPeerPresence(presenceHints);
-
-        const otherPeers = peerList.filter((peer) => peer.username !== currentUsername);
-        const onlineCount = otherPeers.filter(
-          (peer) => (presenceHints[peer.username]?.state ?? "unknown") === "online"
-        ).length;
-
-        if (otherPeers.length === 0) {
-          setStatusMessage("No peers in this network yet.");
-        } else if (onlineCount > 0) {
-          setStatusMessage(`Found ${otherPeers.length} peer(s). ${onlineCount} online now.`);
-        } else {
-          setStatusMessage(`Found ${otherPeers.length} peer(s). None marked online yet.`);
-        }
-      }
-    );
-  }
-
-  async function onQuickConnect() {
-    if (!requireAuth()) return;
-    if (!requirePowerOn()) return;
-    if (!networkId) {
-      setError("Create or join a network first.");
-      return;
-    }
-
-    if (parsedStunServers.length === 0) {
-      setError("Add at least one STUN server in advanced settings.");
-      return;
-    }
-
-    await runAction(
-      "Quick connect",
-      async () => {
-        const [peerList, endpointBundles] = await Promise.all([
-          listPeers({
-            control_plane_url: controlPlaneUrl,
-            access_token: accessToken,
-            network_id: networkId
-          }),
-          listPeerEndpointBundles({
-            control_plane_url: controlPlaneUrl,
-            access_token: accessToken,
-            network_id: networkId
-          }).catch(() => [])
-        ]);
-
-        const candidates = peerList.filter((peer) => peer.username !== currentUsername);
-        if (candidates.length === 0) {
-          throw new Error("NO_PEERS_AVAILABLE");
-        }
-
-        const presenceHints = buildPresenceHints(endpointBundles);
-        const selection = chooseQuickConnectPeer(
-          candidates,
-          peerUsername,
-          preferredPeers[networkId]?.username ?? null,
-          presenceHints
-        );
-
-        if (selection.source !== "typed") {
-          const sourceText =
-            selection.source === "preferred" ? "your preferred friend" : "the best online match";
-          const approved = window.confirm(
-            `Quick connect selected ${selection.username} (${sourceText}). Continue?`
-          );
-
-          if (!approved) {
-            throw new Error("USER_CANCELLED");
-          }
-        }
-
-        const summary = await runSessionProbe({
-          control_plane_url: controlPlaneUrl,
-          access_token: accessToken,
-          network_id: networkId,
-          peer_username: selection.username,
-          stun_servers: parsedStunServers,
-          local_bind_addr: localBindAddr,
-          session_id: runSummary?.session_id
-        });
-
-        return {
-          selectedPeer: selection.username,
-          summary,
-          peerList,
-          presenceHints
-        };
-      },
-      ({ selectedPeer, summary, peerList, presenceHints }) => {
-        setPeers(peerList);
-        setPeerPresence(presenceHints);
-        setPeerUsername(selectedPeer);
-        setRunSummary(summary);
-        rememberPreferredPeer(networkId, selectedPeer);
-        const pathLabel = summary.final_path === "direct" ? "direct LAN tunnel" : "relay tunnel";
-        const usage = connectIntent === "lan" ? "LAN apps" : "VPN traffic";
-        setStatusMessage(`Connected to ${selectedPeer} for ${usage} using ${pathLabel}.`);
-      }
-    );
-  }
-
-  async function onConnectPeer() {
-    if (!requireAuth()) return;
-    if (!requirePowerOn()) return;
-    if (!networkId) {
-      setError("Create or join a network first.");
-      return;
-    }
-
-    const trimmedPeer = peerUsername.trim();
-    if (!trimmedPeer) {
-      setError("Peer username is required.");
-      return;
-    }
-
-    if (parsedStunServers.length === 0) {
-      setError("Add at least one STUN server in advanced settings.");
-      return;
-    }
-
-    await runAction(
-      "Connect",
-      () =>
-        runSessionProbe({
-          control_plane_url: controlPlaneUrl,
-          access_token: accessToken,
-          network_id: networkId,
-          peer_username: trimmedPeer,
-          stun_servers: parsedStunServers,
-          local_bind_addr: localBindAddr,
-          session_id: runSummary?.session_id
-        }),
-      (response) => {
-        setRunSummary(response);
-        rememberPreferredPeer(networkId, trimmedPeer);
-        const pathLabel = response.final_path === "direct" ? "direct LAN tunnel" : "relay tunnel";
-        const usage = connectIntent === "lan" ? "LAN apps" : "VPN traffic";
-        setStatusMessage(`Connected to ${trimmedPeer} for ${usage} using ${pathLabel}.`);
-      }
-    );
-  }
-
-  if (!canUseAuthedActions) {
+  if (!isAuthenticated) {
     return (
       <div className="page">
         <div className="backdrop" />
@@ -863,7 +544,7 @@ export default function App() {
           <section className="panel auth-panel">
             <p className="badge">KAKACHI</p>
             <h1>Virtual LAN for real people</h1>
-            <p className="supporting-copy">Sign in, pick a network, and connect like you are on the same router.</p>
+            <p className="supporting-copy">Normal login. Create/join servers. See members online.</p>
 
             {authView === "login" ? (
               <form onSubmit={onLogin} className="form-stack">
@@ -981,18 +662,32 @@ export default function App() {
           </div>
         </header>
 
+        <section className="panel address-panel">
+          <h2>This Device</h2>
+          <div className="address-grid">
+            <div className="address-item">
+              <span className="address-label">IPv4</span>
+              <span className="address-value">{localAddresses.ipv4[0] ?? "Not available"}</span>
+            </div>
+            <div className="address-item">
+              <span className="address-label">IPv6</span>
+              <span className="address-value">{localAddresses.ipv6[0] ?? "Not available"}</span>
+            </div>
+          </div>
+        </section>
+
         <section className="grid">
           <article className="panel">
             <div className="section-head">
               <h2>Servers</h2>
               <span className={`power-state ${isPowerOn ? "on" : "off"}`}>
-                {isPowerOn ? "Online" : "Offline"}
+                {isPowerOn ? "online" : "offline"}
               </span>
             </div>
-            <p className="inline-info">Create or join a network, then pick it from the list.</p>
+
             <form onSubmit={onCreateNetwork} className="form-stack">
               <label>
-                New network name
+                Create network
                 <input value={networkName} onChange={(event) => setNetworkName(event.target.value)} />
               </label>
               <button disabled={!!busy || !isPowerOn} type="submit">
@@ -1012,13 +707,13 @@ export default function App() {
 
             <div className="server-list">
               {serverList.length === 0 ? (
-                <p className="inline-info">No servers yet. Create or join your first one.</p>
+                <p className="inline-info">No servers yet.</p>
               ) : (
                 serverList.map((server) => (
                   <button
                     key={server.network_id}
                     type="button"
-                    className={`server-item ${networkId === server.network_id ? "active" : ""}`}
+                    className={`server-item ${activeServerId === server.network_id ? "active" : ""}`}
                     onClick={() => onSelectServer(server)}
                   >
                     <span className={`server-dot ${isPowerOn ? "on" : "off"}`} />
@@ -1031,140 +726,63 @@ export default function App() {
                 ))
               )}
             </div>
-
-            {networkId ? (
-              <div className="action-row compact">
-                <button className="secondary" type="button" onClick={onChangeNetwork}>
-                  Clear active server
-                </button>
-                <button className="secondary" type="button" onClick={onCopyNetworkId}>
-                  Copy invite code
-                </button>
-              </div>
-            ) : null}
           </article>
 
-          {networkId && activeServer ? (
-            <article className="panel">
-              <h2>Connect</h2>
-              <p className="inline-info">Active server: {activeServer.name}</p>
+          <article className="panel">
+            <div className="section-head">
+              <h2>Members</h2>
+              <button
+                type="button"
+                className="secondary slim-btn"
+                disabled={!!busy || !activeServerId || !isPowerOn}
+                onClick={onRefreshActiveServerMembers}
+              >
+                {busy === "Refresh members" ? "Refreshing..." : "Refresh"}
+              </button>
+            </div>
 
-              <div className="action-row compact">
-                <button disabled={!!busy || !isPowerOn} onClick={() => onRefreshPeers()}>
-                  {busy === "Refresh peers" ? "Refreshing..." : "Refresh peers"}
-                </button>
-                <button className="secondary" type="button" onClick={onCopyNetworkId}>
-                  Copy invite code
-                </button>
-              </div>
+            {activeServer ? (
+              <p className="inline-info">Server: {activeServer.name}</p>
+            ) : (
+              <p className="inline-info">Select a server to view members.</p>
+            )}
 
-              {!isPowerOn ? (
-                <p className="inline-info">Power is off. Turn it on to connect to this server.</p>
-              ) : null}
-
-              <div className="intent-row">
-                <button
-                  type="button"
-                  className={`intent-btn ${connectIntent === "lan" ? "active" : ""}`}
-                  onClick={() => setConnectIntent("lan")}
-                >
-                  LAN game/app
-                </button>
-                <button
-                  type="button"
-                  className={`intent-btn ${connectIntent === "vpn" ? "active" : ""}`}
-                  onClick={() => setConnectIntent("vpn")}
-                >
-                  Remote VPN
-                </button>
-              </div>
-              <p className="inline-info">Mode: {connectIntentLabel}</p>
-
-              <label>
-                Friend username
-                <input value={peerUsername} onChange={(event) => setPeerUsername(event.target.value)} />
-              </label>
-
-              <div className="peer-list">
-                {visiblePeers.length === 0 ? (
-                  <p className="inline-info">No peers available yet.</p>
+            <div className="peer-list">
+              {activeServer ? (
+                displayedMembers.length === 0 ? (
+                  <p className="inline-info">No members visible yet.</p>
                 ) : (
-                  visiblePeers.map((peer) => {
-                    const hint = peerPresence[peer.username];
-                    const status = hint?.state ?? "unknown";
+                  displayedMembers.map((member) => {
+                    const presence = peerPresence[member.username];
+                    const isOnline =
+                      member.username === currentUsername ? isPowerOn : (presence?.online ?? false);
+
                     return (
-                      <button
-                        key={peer.username}
-                        type="button"
-                        className="peer-item"
-                        onClick={() => setPeerUsername(peer.username)}
-                      >
-                        <span className="server-dot on" />
+                      <div key={member.username} className="peer-item">
+                        <span className={`server-dot ${isOnline ? "on" : "off"}`} />
                         <span className="peer-details">
-                          <span className="peer-name">{peer.username}</span>
-                          <span className="peer-last-seen">{presenceTimeLabel(hint)}</span>
+                          <span className="peer-name">
+                            {member.username}
+                            {member.username === currentUsername ? " (you)" : ""}
+                          </span>
+                          <span className="peer-last-seen">
+                            {isOnline ? "Active now" : formatLastSeen(presence?.lastSeenAt ?? null)}
+                          </span>
                         </span>
-                        <span className={`peer-presence ${status}`}>{presenceLabel(status)}</span>
-                      </button>
+                        <span className={`peer-presence ${isOnline ? "online" : "offline"}`}>
+                          {isOnline ? "online" : "offline"}
+                        </span>
+                      </div>
                     );
                   })
-                )}
-              </div>
-
-              <button className="quick-connect" disabled={!!busy || !isPowerOn} onClick={onQuickConnect}>
-                {busy === "Quick connect" ? "Connecting..." : "Quick connect"}
-              </button>
-              <p className="inline-info">
-                This picks the typed friend, then your preferred friend, then the best online candidate.
-              </p>
-              <p className="inline-info">Kakachi asks for confirmation before auto-connecting to a selected friend.</p>
-              {preferredPeer ? (
-                <p className="inline-info">
-                  Preferred friend for this network: {preferredPeer.username}.
-                </p>
+                )
               ) : null}
-
-              <p className={`connection-pill ${runSummary?.final_path ?? "idle"}`}>{connectionLabel}</p>
-              {runSummary ? <p className="inline-info">Reason: {runSummary.final_reason}</p> : null}
-
-              <details>
-                <summary>Manual controls</summary>
-
-                <div className="action-row">
-                  <button disabled={!!busy || !isPowerOn} onClick={() => onRefreshPeers()}>
-                    {busy === "Refresh peers" ? "Refreshing..." : "Refresh peers"}
-                  </button>
-                  <button disabled={!!busy || !isPowerOn} onClick={onConnectPeer}>
-                    {busy === "Connect" ? "Connecting..." : "Connect manually"}
-                  </button>
-                </div>
-              </details>
-
-              <details>
-                <summary>Advanced connection settings</summary>
-                <div className="form-stack advanced-grid">
-                  <label>
-                    STUN servers (comma separated)
-                    <input value={stunServersCsv} onChange={(event) => setStunServersCsv(event.target.value)} />
-                  </label>
-                  <label>
-                    Local bind address
-                    <input value={localBindAddr} onChange={(event) => setLocalBindAddr(event.target.value)} />
-                  </label>
-                </div>
-              </details>
-            </article>
-          ) : (
-            <article className="panel muted-panel">
-              <h2>Connect</h2>
-              <p className="inline-info">Create or join a server, then select it from the list.</p>
-            </article>
-          )}
+            </div>
+          </article>
         </section>
 
         {error ? <p className="banner error">{error}</p> : null}
         {statusMessage ? <p className="banner status">{statusMessage}</p> : null}
-        <p className="inline-info">Session expires at: {tokenExpiresAt}</p>
       </main>
     </div>
   );

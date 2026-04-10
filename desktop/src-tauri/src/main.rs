@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -330,6 +331,12 @@ struct NetworkSummaryResponse {
     created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LocalAddressSummary {
+    ipv4: Vec<String>,
+    ipv6: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct GeneratedKeyPair {
     public_key: String,
@@ -477,6 +484,49 @@ async fn list_peer_endpoint_bundles(
     api.get_json(&path, Some(input.access_token.trim()))
         .await
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn get_local_addresses() -> Result<LocalAddressSummary, String> {
+    let interfaces = if_addrs::get_if_addrs().map_err(|error| error.to_string())?;
+
+    let mut ipv4_non_loopback = BTreeSet::new();
+    let mut ipv4_loopback = BTreeSet::new();
+    let mut ipv6_non_loopback = BTreeSet::new();
+    let mut ipv6_loopback = BTreeSet::new();
+
+    for interface in interfaces {
+        match interface.addr {
+            if_addrs::IfAddr::V4(addr) => {
+                let value = addr.ip.to_string();
+                if addr.ip.is_loopback() {
+                    ipv4_loopback.insert(value);
+                } else {
+                    ipv4_non_loopback.insert(value);
+                }
+            }
+            if_addrs::IfAddr::V6(addr) => {
+                let value = addr.ip.to_string();
+                if addr.ip.is_loopback() {
+                    ipv6_loopback.insert(value);
+                } else {
+                    ipv6_non_loopback.insert(value);
+                }
+            }
+        }
+    }
+
+    let mut ipv4 = ipv4_non_loopback.into_iter().collect::<Vec<_>>();
+    if ipv4.is_empty() {
+        ipv4 = ipv4_loopback.into_iter().collect::<Vec<_>>();
+    }
+
+    let mut ipv6 = ipv6_non_loopback.into_iter().collect::<Vec<_>>();
+    if ipv6.is_empty() {
+        ipv6 = ipv6_loopback.into_iter().collect::<Vec<_>>();
+    }
+
+    Ok(LocalAddressSummary { ipv4, ipv6 })
 }
 
 #[tauri::command]
@@ -631,6 +681,7 @@ pub fn run() {
             join_network,
             list_peers,
             list_peer_endpoint_bundles,
+            get_local_addresses,
             open_session_negotiation,
             get_session_negotiation,
             run_session_negotiation,
