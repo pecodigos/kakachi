@@ -24,6 +24,7 @@ use uuid::Uuid;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let _ = dotenvy::dotenv();
     init_tracing();
 
     let state = build_app_state()?;
