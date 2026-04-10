@@ -1,16 +1,16 @@
-@import url("https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;700&family=Space+Mono:wght@400;700&display=swap");
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap");
 
 :root {
-  --bg: #eef4f9;
-  --bg-strong: #d9e9f5;
-  --panel: rgba(255, 255, 255, 0.9);
-  --ink: #112331;
-  --ink-muted: #4e6477;
-  --line: #c9d8e4;
-  --action: #0a7b58;
-  --action-hover: #066045;
-  --action-alt: #0d4566;
-  --danger: #9f1f1f;
+  --bg: #000000;
+  --bg-strong: #0a0a0b;
+  --panel: rgba(29, 29, 31, 0.92);
+  --ink: #f5f5f7;
+  --ink-muted: rgba(245, 245, 247, 0.72);
+  --line: #333336;
+  --action: #0071e3;
+  --action-hover: #2997ff;
+  --action-alt: #2a2a2d;
+  --danger: #ff453a;
 }
 
 * {
@@ -21,8 +21,8 @@ body {
   margin: 0;
   min-height: 100vh;
   color: var(--ink);
-  background: linear-gradient(140deg, #f4f8fb 0%, #eaf2fa 48%, #edf8f5 100%);
-  font-family: "Manrope", sans-serif;
+  background: radial-gradient(circle at 18% 14%, #1d1d1f 0%, #0b0b0d 40%, #000 100%);
+  font-family: "Inter", -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
 }
 
 button,
@@ -42,9 +42,9 @@ input {
   inset: 0;
   pointer-events: none;
   background:
-    radial-gradient(circle at 12% 22%, rgba(13, 69, 102, 0.18), transparent 42%),
-    radial-gradient(circle at 86% 14%, rgba(10, 123, 88, 0.16), transparent 40%),
-    radial-gradient(circle at 50% 100%, rgba(17, 35, 49, 0.08), transparent 44%);
+    radial-gradient(circle at 16% 18%, rgba(41, 151, 255, 0.24), transparent 45%),
+    radial-gradient(circle at 82% 16%, rgba(41, 151, 255, 0.12), transparent 42%),
+    radial-gradient(circle at 52% 100%, rgba(255, 255, 255, 0.06), transparent 38%);
   animation: drift 16s ease-in-out infinite;
 }
 
@@ -87,9 +87,9 @@ input {
 
 .panel {
   border: 1px solid var(--line);
-  border-radius: 20px;
+  border-radius: 16px;
   background: var(--panel);
-  box-shadow: 0 18px 40px rgba(17, 35, 49, 0.09);
+  box-shadow: rgba(0, 0, 0, 0.45) 3px 5px 30px 0px;
   backdrop-filter: blur(8px);
   padding: 1.1rem;
 }
@@ -124,10 +124,10 @@ h2 {
 
 .badge {
   margin: 0;
-  font-family: "Space Mono", monospace;
-  font-size: 0.75rem;
-  letter-spacing: 0.18em;
-  color: var(--action-alt);
+  font-size: 0.72rem;
+  letter-spacing: 0.22em;
+  color: rgba(245, 245, 247, 0.64);
+  text-transform: uppercase;
 }
 
 .supporting-copy {
@@ -139,7 +139,7 @@ h2 {
 label {
   display: grid;
   gap: 0.35rem;
-  font-size: 0.9rem;
+  font-size: 0.88rem;
   font-weight: 600;
   color: var(--ink-muted);
 }
@@ -147,14 +147,14 @@ label {
 input {
   width: 100%;
   border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: 10px;
   padding: 0.62rem 0.68rem;
-  background: rgba(255, 255, 255, 0.95);
+  background: #1c1c1e;
   color: var(--ink);
 }
 
 input:focus {
-  outline: 2px solid rgba(13, 69, 102, 0.2);
+  outline: 2px solid rgba(0, 113, 227, 0.34);
   outline-offset: 0;
 }
 
@@ -165,17 +165,17 @@ input:focus {
 
 button {
   border: 0;
-  border-radius: 12px;
+  border-radius: 980px;
   padding: 0.65rem 0.9rem;
-  background: linear-gradient(135deg, var(--action) 0%, #0b8e66 100%);
+  background: linear-gradient(135deg, var(--action) 0%, #2997ff 100%);
   color: #fff;
-  font-weight: 700;
+  font-weight: 500;
   cursor: pointer;
   transition: background 150ms ease, transform 150ms ease;
 }
 
 button:hover {
-  background: linear-gradient(135deg, var(--action-hover) 0%, #0a7b58 100%);
+  background: linear-gradient(135deg, var(--action-hover) 0%, #5ab2ff 100%);
   transform: translateY(-1px);
 }
 
@@ -186,16 +186,16 @@ button:disabled {
 }
 
 .secondary {
-  background: linear-gradient(135deg, var(--action-alt) 0%, #0b5a86 100%);
+  background: linear-gradient(135deg, #2a2a2d 0%, #3a3a3f 100%);
 }
 
 .link-button {
   border: 0;
   background: transparent;
-  color: var(--action-alt);
+  color: #2997ff;
   text-align: left;
   padding: 0;
-  font-weight: 700;
+  font-weight: 600;
   cursor: pointer;
 }
 
@@ -214,6 +214,7 @@ button:disabled {
 .checkbox-row input {
   width: 16px;
   height: 16px;
+  accent-color: #2997ff;
 }
 
 .grid {
@@ -242,13 +243,13 @@ button:disabled {
 }
 
 .intent-btn {
-  background: #eef4f8;
-  color: #224b66;
-  border: 1px solid #c7d6e2;
+  background: #1c1c1e;
+  color: rgba(245, 245, 247, 0.86);
+  border: 1px solid #333336;
 }
 
 .intent-btn.active {
-  background: linear-gradient(135deg, var(--action-alt) 0%, #0b5a86 100%);
+  background: linear-gradient(135deg, var(--action) 0%, #2997ff 100%);
   color: #fff;
   border-color: transparent;
 }
@@ -257,7 +258,7 @@ button:disabled {
   display: grid;
   align-content: center;
   min-height: 240px;
-  background: rgba(245, 250, 255, 0.7);
+  background: rgba(23, 23, 25, 0.7);
 }
 
 .connection-pill {
@@ -267,18 +268,18 @@ button:disabled {
   width: fit-content;
   font-weight: 700;
   font-size: 0.85rem;
-  background: #e5edf3;
-  color: var(--action-alt);
+  background: #242426;
+  color: rgba(245, 245, 247, 0.74);
 }
 
 .connection-pill.direct {
-  background: #daf3e8;
-  color: #045f42;
+  background: rgba(41, 151, 255, 0.18);
+  color: #73beff;
 }
 
 .connection-pill.relay {
-  background: #e5ecf6;
-  color: #164a74;
+  background: rgba(82, 82, 88, 0.62);
+  color: #d8d8dc;
 }
 
 .quick-connect {
@@ -287,7 +288,7 @@ button:disabled {
   margin-bottom: 0.25rem;
   padding: 0.78rem 0.9rem;
   font-size: 1rem;
-  background: linear-gradient(135deg, #0a7b58 0%, #0c936b 100%);
+  background: linear-gradient(135deg, #0071e3 0%, #2997ff 100%);
 }
 
 .inline-info {
@@ -308,9 +309,9 @@ button:disabled {
   align-items: center;
   justify-content: space-between;
   gap: 0.55rem;
-  background: #f1f6fb;
-  color: #24465f;
-  border: 1px solid #c5d6e3;
+  background: #1c1c1e;
+  color: #f5f5f7;
+  border: 1px solid #333336;
   font-weight: 600;
 }
 
@@ -326,11 +327,11 @@ button:disabled {
 
 .peer-last-seen {
   font-size: 0.72rem;
-  color: #4d6376;
+  color: rgba(245, 245, 247, 0.58);
 }
 
 .peer-item:hover {
-  background: #e6f0f8;
+  background: #2a2a2d;
 }
 
 .peer-presence {
@@ -339,30 +340,30 @@ button:disabled {
   font-size: 0.72rem;
   text-transform: uppercase;
   letter-spacing: 0.06em;
-  background: #dce7f0;
-  color: #35566f;
+  background: #2a2a2d;
+  color: rgba(245, 245, 247, 0.72);
 }
 
 .peer-presence.online {
-  background: #d8f1e4;
-  color: #0f6b4a;
+  background: rgba(41, 151, 255, 0.2);
+  color: #8ac9ff;
 }
 
 .peer-presence.recent {
-  background: #e7eef8;
-  color: #1d4d73;
+  background: rgba(245, 245, 247, 0.12);
+  color: rgba(245, 245, 247, 0.8);
 }
 
 details {
   margin-top: 0.9rem;
-  border: 1px dashed #c5d6e2;
+  border: 1px dashed #333336;
   border-radius: 12px;
   padding: 0.55rem 0.65rem;
 }
 
 summary {
   cursor: pointer;
-  color: var(--action-alt);
+  color: #2997ff;
   font-weight: 700;
   margin-bottom: 0.5rem;
 }
@@ -379,14 +380,14 @@ summary {
 }
 
 .banner.status {
-  border: 1px solid #bfd7ea;
-  background: #edf6ff;
-  color: #234a68;
+  border: 1px solid rgba(41, 151, 255, 0.38);
+  background: rgba(41, 151, 255, 0.16);
+  color: #8ac9ff;
 }
 
 .banner.error {
-  border: 1px solid #f3c2c2;
-  background: #fff3f2;
+  border: 1px solid rgba(255, 69, 58, 0.36);
+  background: rgba(255, 69, 58, 0.12);
   color: var(--danger);
 }
 

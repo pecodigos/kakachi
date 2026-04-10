@@ -269,7 +269,7 @@ function chooseQuickConnectPeer(
 export default function App() {
   const [authView, setAuthView] = useState<AuthView>("login");
   const [controlPlaneUrl, setControlPlaneUrl] = useState("http://127.0.0.1:8080");
-  const [statusMessage, setStatusMessage] = useState("Sign in to start your virtual LAN.");
+  const [statusMessage, setStatusMessage] = useState("");
 
   const [registerUsername, setRegisterUsername] = useState("");
   const [registerEmail, setRegisterEmail] = useState("");
@@ -808,15 +808,6 @@ export default function App() {
             <h1>Virtual LAN for real people</h1>
             <p className="supporting-copy">Sign in, pick a network, and connect like you are on the same router.</p>
 
-            <label>
-              Server address
-              <input
-                value={controlPlaneUrl}
-                onChange={(event) => setControlPlaneUrl(event.target.value)}
-                placeholder="http://127.0.0.1:8080"
-              />
-            </label>
-
             {authView === "login" ? (
               <form onSubmit={onLogin} className="form-stack">
                 <label>
@@ -895,7 +886,7 @@ export default function App() {
             </button>
 
             {error ? <p className="banner error">{error}</p> : null}
-            <p className="banner status">{statusMessage}</p>
+            {statusMessage ? <p className="banner status">{statusMessage}</p> : null}
             <p className="inline-info">
               Secure save login: {secureStorageState === "unknown" ? "checking..." : secureStorageState}.
             </p>
@@ -1061,7 +1052,7 @@ export default function App() {
         </section>
 
         {error ? <p className="banner error">{error}</p> : null}
-        <p className="banner status">{statusMessage}</p>
+        {statusMessage ? <p className="banner status">{statusMessage}</p> : null}
         <p className="inline-info">Session expires at: {tokenExpiresAt}</p>
       </main>
     </div>
